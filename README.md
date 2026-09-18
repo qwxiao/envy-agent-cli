@@ -5,14 +5,14 @@
 一个跑在终端的 AI 编程体：LLM 流式客户端 + ReAct 主循环 + 受控的工具执行系统（Tool Runtime）。
 分层、契约、边界都在 [ARCHITECTURE.md](ARCHITECTURE.md) 里封版。
 
-## 当前状态：接口骨架（Interface Freeze）
+## 当前状态
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
 | 模块1 LLM 流式客户端 | 🟢 **实现完成** | 事件协议 / 传输层（SSE 分帧）/ Adapter 归一化 / 工厂 / RetryPolicy / 输出契约层 |
 | 模块2 ReAct 主循环 | 🟢 **实现完成** | 四重预算 / 两级打转检测 / 契约纠错独立预算 / 七种终止状态 / 渲染注入 |
 | 模块3 工具层（Tool Runtime） | 🟢 **实现完成** | 八步执行顺序 / 两级鉴权 / HITL + 拒绝升级 / 只读并发 / 超时熔断 / 审计 / 脱敏 |
-| 模块4 上下文压缩器 | ⚪ 目录占位 | 接口待定 |
+| 模块4 上下文压缩器 | 🟢 **实现完成** | 工具包边界切分 / 双阈值双触发 / system 永不进摘要 / 两级收缩 / 摘要失败回退 |
 
 **现在是一个能真干活的 Agent**：
 
@@ -22,6 +22,13 @@ uv run envy --hitl never "看看当前目录有哪些文件，再读一下 READM
 
 模型自己决定调哪个工具、看结果、再决定下一步；每次调用都过 Runtime 的八步治理，
 审计轨迹落在 `audit/cli.jsonl`（用 trace_id 可串起一次完整任务）。
+
+长任务会撑爆窗口，所以每轮发请求前先过压缩器：超预算就把旧轮次摘要掉。
+
+```bash
+uv run envy --context-window 8000 "把这个项目的每个源文件都读一遍，然后总结架构"   # 小窗口逼出压缩
+uv run envy --no-compact "..."                                                     # 关掉压缩（对照）
+```
 
 > **为什么先封接口再写实现**：架构没定就写，写多少废多少。接口定了，实现怎么写都不会跑偏。
 
@@ -45,8 +52,11 @@ src/envy_agent_cli/
 │   ├── result.py         ToolResult / ToolError（执行契约）
 │   ├── runtime.py        ToolRuntime —— 唯一执行入口（七职责）
 │   └── builtin.py        内置工具（read_file / list_dir / write_file）
+├── context/            模块4 · 上下文预算与压缩
+│   ├── compactor.py      预算 / 切分红线 / 两级收缩（纯计算，零 IO）
+│   ├── summary_rule.py   规则摘要引擎（默认档）
+│   └── summary_llm.py    LLM 摘要引擎（可选档，唯一碰模型 IO 的地方）
 ├── trace.py            三级链路追踪（跨层共享的叶子模块）
-├── context/            模块4 · 上下文预算（占位）
 └── audit/              审计日志（JSONL，给评测当数据源）
 ```
 

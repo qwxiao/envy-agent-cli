@@ -16,6 +16,12 @@ from pathlib import Path
 
 from envy_agent_cli.audit.logger import AuditLogger
 from envy_agent_cli.config import DEFAULT_PROVIDER, describe_config, load_settings
+from envy_agent_cli.context import (
+    ContextBudget,
+    ContextWindowManager,
+    NoopContextPolicy,
+    RuleSummaryEngine,
+)
 from envy_agent_cli.llm import ChatParams, available, build
 from envy_agent_cli.llm.adapter import PROVIDER_DEFAULTS
 from envy_agent_cli.llm.events import LLMErrorCode
@@ -30,11 +36,18 @@ USAGE = """用法：
   envy --model glm-5.3-flash <问题>  临时换模型
   envy --hitl never|auto|always      人工确认策略（默认 auto：只问有副作用的）
   envy --max-rounds 5 <问题>         临时改轮数上限
+  envy --context-window 128000 <问题> 模型窗口（用于上下文压缩的预算线）
+  envy --no-compact <问题>           关掉上下文压缩（历史原样累积，长任务会撑爆窗口）
   envy --yes                         本次全自动（等价于 --hitl never）
   envy --list-providers              列出已注册厂商与默认入口
 
 凭证来自环境变量或 .env：<厂商名>_API_KEY（如 DEEPSEEK_API_KEY / GLM_API_KEY）。
-审计轨迹写在 audit/cli.jsonl，可用 trace_id 串起一次任务。"""
+审计轨迹写在 audit/cli.jsonl，可用 trace_id 串起一次任务。
+
+上下文压缩默认开：每轮发请求前检查历史是否超预算，超了就把旧轮次摘要掉。
+压缩事件落在审计里（kind=compact），与结果里的 context_events 同源。"""
+
+DEFAULT_CONTEXT_WINDOW = 128_000
 
 SYSTEM_PROMPT = (
     "你是一个终端编程助手。可以使用工具来查看和修改工作区里的文件。\n"
@@ -98,22 +111,42 @@ def main(argv: list[str] | None = None) -> int:
     audit = None if "no-audit" in options else AuditLogger(Path("audit") / "cli.jsonl")
     runtime = ToolRuntime(workspace=workspace, hitl_mode=hitl_mode, audit=audit)
 
-    print(f"[{adapter.name} · {adapter.model}] 工作区 {workspace}  HITL={hitl_mode}",
-          file=sys.stderr)
+    params = ChatParams(max_tokens=2048)
+    if "no-compact" in options:
+        policy = NoopContextPolicy()
+    else:
+        try:
+            window = int(options.get("context-window") or DEFAULT_CONTEXT_WINDOW)
+        except ValueError:
+            print("参数错误：--context-window 需要是整数", file=sys.stderr)
+            return 2
+        policy = ContextWindowManager(
+            ContextBudget(context_window=window, max_output_tokens=params.max_tokens or 4096),
+            summary_engine=RuleSummaryEngine(),
+        )
+
+    print(f"[{adapter.name} · {adapter.model}] 工作区 {workspace}  HITL={hitl_mode}  "
+          f"压缩={'关' if 'no-compact' in options else '开'}", file=sys.stderr)
 
     result = run(" ".join(rest),
                  adapter=adapter,
                  runtime=runtime,
                  tool_schemas=to_model_schemas(),
                  render=ConsoleRenderer(),
-                 params=ChatParams(max_tokens=2048),
+                 params=params,
                  system_prompt=SYSTEM_PROMPT,
-                 audit=audit)
+                 audit=audit,
+                 context_policy=policy)
 
     print()
     summary = (f"[{result.stop_reason}] 轮数={result.iterations} "
-               f"工具调用={result.tool_calls_total} tokens={result.usage.total_tokens if result.usage else 0}")
+               f"工具调用={result.tool_calls_total} tokens={result.usage.total_tokens if result.usage else 0} "
+               f"压缩={len(result.context_events)}次")
     print(summary, file=sys.stderr)
+    for event in result.context_events:
+        print(f"[压缩] {event.span_id} {event.before_tokens} -> {event.after_tokens} tokens，"
+              f"摘要 {event.summarized_messages} 条（{event.triggered_by}，{event.summary_engine}）",
+              file=sys.stderr)
     if result.detail:
         print(f"[说明] {result.detail}", file=sys.stderr)
     if result.trace_id:

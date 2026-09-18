@@ -10,7 +10,7 @@
 
 **记录分两类，用 `kind` 区分**：
 - `kind="tool"`：一次工具执行（由 `ToolRuntime` 写）
-- `kind="reasoning"` / `"round"` / `"stream_error"` / `"stop"`：编排层事件（由 Loop 写）
+- `kind="reasoning"` / `"round"` / `"stream_error"` / `"stop"` / `"compact"` / `"compress_failed"`：编排层事件（由 Loop 写）
 
 审计要能回答的问题包括："模型产生过几次非法调用""这一轮有几个调用是残缺的"
 "推理摘要是什么""为什么终止"——这些数字评测要用，丢了就补不回来。
@@ -32,7 +32,7 @@ class AuditRecord:
     编排层事件类记录把载荷放进 `detail`（推理文本、调用计数、终止原因…）。
     """
 
-    kind: str                                # tool | reasoning | round | stream_error | stop
+    kind: str                                # tool | reasoning | round | stream_error | stop | compact | compress_failed
     trace_id: str
     span_id: str | None = None
     parent_span_id: str | None = None

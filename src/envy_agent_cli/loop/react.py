@@ -22,9 +22,15 @@ Runtime 的输入契约是"结构化的调用"，**字符串不是它的语言**
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from envy_agent_cli.audit.logger import AuditLogger
+from envy_agent_cli.context.compactor import (
+    ContextEvent,
+    ContextPolicy,
+    NoopContextPolicy,
+    to_context_event,
+)
 from envy_agent_cli.llm.adapter import ChatMessage, ChatModel
 from envy_agent_cli.llm.events import (
     Error,
@@ -104,6 +110,7 @@ class AgentResult:
     detail: str | None = None             # 终止补充说明（哪种预算耗尽、打转指纹、最后校验错误）
     usage: Usage | None = None            # 累计 token（真实值，来自服务端 usage）
     tool_calls_total: int = 0             # 累计工具调用数
+    context_events: list[ContextEvent] = field(default_factory=list)  # 每次压缩的记录（只交事件，不交快照）
 
 
 def run(
@@ -121,6 +128,7 @@ def run(
     output_contract: OutputContract | None = None,
     audit: AuditLogger | None = None,
     audit_reasoning: bool = True,
+    context_policy: ContextPolicy | None = None,
 ) -> AgentResult:
     """跑完一次完整的用户任务。
 
@@ -130,11 +138,15 @@ def run(
     Args:
         system_prompt: 可选的系统提示。**注入防护第 1 级的"声明"那一半就落在这里**——
             工具结果已经被 Runtime 包进 `<tool_result>`，系统提示负责声明其中的内容不可信。
+        context_policy: 可选的上下文策略，每轮发请求前调用一次。**"不压缩"也是一个策略**
+            （`NoopContextPolicy`），不是"没实现"——所以默认值用 `None` 哨兵而不是直接 new，
+            避免默认参数在定义时求值、被所有调用共享同一个实例。
     """
     render = render or ConsoleRenderer()
     params = params or ChatParams()
     budget = budget or Budget()
     no_progress = no_progress or NoProgressPolicy()
+    policy = context_policy or NoopContextPolicy()
 
     trace = new_trace()
     messages: list[ChatMessage] = []
@@ -150,6 +162,7 @@ def run(
     prev_full: tuple | None = None
     repeat_call = repeat_full = 0
     round_no = 0
+    context_events: list[ContextEvent] = []
 
     def finish(text: str, stop_reason: str, truncated: bool = False,
                detail: str | None = None) -> AgentResult:
@@ -162,7 +175,8 @@ def run(
                            truncated=truncated, stop_reason=stop_reason, trace_id=trace.trace_id,
                            detail=detail,
                            usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=tokens_used),
-                           tool_calls_total=tool_calls_total)
+                           tool_calls_total=tool_calls_total,
+                           context_events=context_events)
 
     for round_no in range(1, budget.max_rounds + 1):
         round_ctx = round_span(trace, round_no)
@@ -175,6 +189,21 @@ def run(
         if tokens_used >= budget.max_tokens:
             return finish(_last_assistant_text(messages), STOP_BUDGET, True,
                           f"token 预算耗尽（{tokens_used} >= {budget.max_tokens}）")
+
+        # —— 上下文压缩：每轮发请求前一次，且只有这一处。
+        # 压缩后 messages 重新绑定：Loop 手里的是"模型看到的"，不是"客观发生的"——
+        # 被压掉的原文就此离开主链路，它的去向记录在 context_events 与审计里。
+        prepared = policy.prepare(messages, tool_definitions=tool_schemas, trace=round_ctx)
+        if prepared.failure and audit is not None:
+            audit.event("compress_failed", round_ctx, engine=prepared.summary_engine,
+                        error=prepared.failure, triggered_by=prepared.triggered_by)
+        if prepared.compressed:
+            messages = list(prepared.messages)
+            event = to_context_event(prepared, round_ctx.span_id)
+            context_events.append(event)
+            if audit is not None:
+                audit.event("compact", round_ctx,
+                            **{k: v for k, v in asdict(event).items() if k != "span_id"})
 
         events = adapter.stream_chat(messages, tools=tool_schemas, params=params, trace=round_ctx)
         result = _consume_stream(events, render)
