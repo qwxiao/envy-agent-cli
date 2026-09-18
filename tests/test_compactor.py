@@ -401,15 +401,30 @@ def test_system_message_survives_compression():
     assert result.messages[0]["role"] == "system"
 
 
-def test_summary_message_is_plain_assistant_without_tool_calls():
-    """验收 11：摘要必须是 assistant + 纯文本。带 tool_calls 会被当成调用请求 → 孤儿 → 400。"""
+def test_summary_message_is_plain_text_without_tool_calls():
+    """验收 11：摘要必须是纯文本。带 `tool_calls` 会被当成调用请求 → 孤儿 → 400。"""
     messages = long_task(30)
     m = manager(budget=tight_budget(messages))
     result = m.prepare(messages)
     summaries = [x for x in result.messages if SUMMARY_TAG in str(x.get("content"))]
     assert len(summaries) == 1
-    assert summaries[0]["role"] == "assistant"
     assert "tool_calls" not in summaries[0]
+
+
+def test_summary_role_is_user_because_the_protocol_demands_it():
+    """摘要必须是 `user`：system 之后的第一条消息不能是 `assistant`。
+
+    这条有实测背书：摘要放 `assistant` 时，DeepSeek 与 GLM **都**返回 400——
+    服务端要求 system 之后先出现 user。语义上摘要更像"我此前说过什么的注记"，
+    但那属于内部偏好；**协议约束违反的后果是请求根本发不出去，两者不是同一个量级。**
+    """
+    messages = long_task(30)
+    m = manager(budget=tight_budget(messages))
+    result = m.prepare(messages)
+    index = next(i for i, x in enumerate(result.messages) if SUMMARY_TAG in str(x.get("content")))
+    assert result.messages[index]["role"] == "user"
+    assert result.messages[0]["role"] == "system"
+    assert result.messages[index - 1]["role"] == "system"
 
 
 def test_summary_sits_after_the_system_message():
@@ -566,7 +581,7 @@ def test_rule_engine_handles_empty_turns():
 
 def test_summary_message_shape():
     message = build_summary_message("要点")
-    assert message["role"] == "assistant"
+    assert message["role"] == "user"
     assert "tool_calls" not in message
     assert f"<{SUMMARY_TAG}>" in message["content"]
 

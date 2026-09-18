@@ -39,6 +39,7 @@ ENGINE_LLM = "llm"
 SYSTEM_ROLE = "system"
 TOOL_ROLE = "tool"
 ASSISTANT_ROLE = "assistant"
+USER_ROLE = "user"
 
 #: 摘要消息的标签。它**不是**用来补救角色的（角色本身已经是正确的），
 #: 而是给审计和评测做锚点——`grep history_summary` 能定位到摘要。
@@ -263,13 +264,17 @@ def to_context_event(result: PrepareResult, span_id: str) -> ContextEvent:
 
 
 def build_summary_message(text: str) -> dict:
-    """摘要消息：`assistant` + 纯文本，**绝不能带 `tool_calls`**。
+    """摘要消息：`user` + 纯文本，**绝不能带 `tool_calls`**。
 
-    角色选 `assistant` 是因为角色本身就是语义权重——摘要的语义是"关于我之前说过什么的注记"，
-    它属于 assistant 侧。标成 `user` 会被读成"用户现在要求我做某事"，权重拉高。
-    带 `tool_calls` 则会被当成一个工具调用请求，而它没有对应的 `tool` 回复 → 孤儿 → 400。
+    **角色由协议决定，不由语义偏好决定。** 隔离测试过：摘要放 `assistant` 时，
+    DeepSeek 与 GLM **都**返回 400（system 之后的第一条消息必须是 `user`；
+    DeepSeek 的报错文本会误导成 `reasoning_content`，与它无关）。
+    语义上摘要更像"我此前说过什么的注记"，但那属于内部偏好——
+    **协议约束违反的后果是请求根本发不出去，两者不是同一个量级。**
+
+    `<history_summary>` 标签承担两件事：让模型知道这段是有损的压缩稿，以及给审计当锚点。
     """
-    return {"role": ASSISTANT_ROLE, "content": f"<{SUMMARY_TAG}>\n{text}\n</{SUMMARY_TAG}>"}
+    return {"role": USER_ROLE, "content": f"<{SUMMARY_TAG}>\n{text}\n</{SUMMARY_TAG}>"}
 
 
 # ---------------------------------------------------------------- 契约
