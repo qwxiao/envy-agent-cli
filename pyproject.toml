@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "envy-agent-cli"
+version = "0.1.0"
+description = "终端 Coding Agent CLI（类 Claude Code），核心引擎自研：LLM 流式客户端 + ReAct 主循环 + Tool Runtime"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["agent", "llm", "cli", "react", "tool-calling", "harness"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# 依赖留空：骨架阶段不引入任何运行时依赖。
+# 传输层实现时再加 httpx；参数校验升级 Pydantic 时再加 pydantic。
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+envy = "envy_agent_cli.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/envy_agent_cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

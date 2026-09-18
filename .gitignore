@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 测试与工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# 环境变量与密钥（API Key 绝不入库）
+.env
+.env.*
+!.env.example
+
+# 运行时产物
+*.log
+audit/*.jsonl
+.cache/
