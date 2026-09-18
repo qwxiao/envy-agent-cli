@@ -33,11 +33,18 @@ RETRYABLE_CODES = frozenset({ErrorCode.TIMEOUT, ErrorCode.UPSTREAM_ERROR})
 
 @dataclass(slots=True)
 class ToolResult:
-    """成功路径的归一化结果。"""
+    """一次调用的归一化结果。
+
+    Attributes:
+        executed: **是否真的派发到了工具函数**。
+            参数不是合法 JSON、工具未注册、权限判定不通过时都是 `False`——
+            "执行了但失败"与"根本没执行"是**两个不同的指标**，审计与评测都要能分开统计。
+    """
 
     content: str
     is_error: bool = False
     tool_call_id: str | None = None
+    executed: bool = True
 
 
 @dataclass(slots=True)

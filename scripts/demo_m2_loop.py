@@ -13,7 +13,9 @@
 """
 
 import sys
+from pathlib import Path
 
+from envy_agent_cli.audit.logger import AuditLogger
 from envy_agent_cli.config import load_settings
 from envy_agent_cli.llm import ChatParams, build
 from envy_agent_cli.loop import ConsoleRenderer, run
@@ -112,16 +114,24 @@ def main() -> int:
     print(f"=== {adapter.name} · {adapter.model} ===")
     print(f"问题：{question}\n--- 模型输出 ---")
 
+    audit = AuditLogger(Path("audit") / "demo_m2.jsonl")
     result = run(question, adapter=adapter, runtime=runtime,
                  tool_schemas=to_model_schemas(),
                  render=ConsoleRenderer(),
-                 params=ChatParams(max_tokens=1024))
+                 params=ChatParams(max_tokens=1024),
+                 audit=audit)
 
     print("\n--- 结果 ---")
     print(f"轮数={result.iterations}  stop_reason={result.stop_reason}  结果完整={not result.truncated}")
     print(f"trace_id={result.trace_id}")
-    print(f"工具调用 {len(runtime.seen)} 次：{[c.get('name') for c in runtime.seen]}")
+    print(f"工具调用 {result.tool_calls_total} 次：{[c.get('name') for c in runtime.seen]}")
     print(f"消息角色序列：{[m['role'] for m in result.messages]}")
+
+    records = audit.trace_lines(result.trace_id)
+    kinds: dict[str, int] = {}
+    for record in records:
+        kinds[record.kind] = kinds.get(record.kind, 0) + 1
+    print(f"审计落盘：{audit.path}（本次任务 {len(records)} 条，按类型 {kinds}）")
     return 1 if result.truncated else 0
 
 

@@ -62,11 +62,15 @@ class ToolRuntime:
 
         Args:
             call: 编排层拼装并解析后的调用，两种形态：
-                - 正常：`{"id": ..., "name": ..., "arguments": {...}}`
-                - 参数不是合法 JSON：`{"id": ..., "name": ..., "arguments": None,
+                - 正常：`{"seq": int, "id": ..., "name": ..., "arguments": {...}}`
+                - 参数不是合法 JSON：`{"seq": int, "id": ..., "name": ..., "arguments": None,
                   "parse_error": "..."}` —— 此时**不派发 handler**，
-                  直接产出 `INVALID_ARGUMENT` 的结构化结果（仍记审计，模型也要看到它）。
+                  直接产出 `INVALID_ARGUMENT` 的结构化结果（`executed=False`，仍记审计，
+                  模型也要看到它）。
             trace: 调用级追踪上下文。
+
+        注意输入契约：Runtime 只接受**结构化的调用**，`arguments` 必须是 dict。
+        字符串不是它的语言——`json.loads` 由编排层做完（职责划分见 loop/react.py 模块说明）。
         """
         raise NotImplementedError("待实现：七职责串联")
 

@@ -77,9 +77,21 @@ Tool = 声明层（ToolSpec：可序列化 / 可审计 / 可给模型看）
 ## 五、结果与错误契约
 
 ```python
-ToolResult(content: str, is_error: bool = False, tool_call_id: str | None = None)
+ToolResult(content: str, is_error: bool = False, tool_call_id: str | None = None,
+           executed: bool = True)          # executed=False：未注册 / 参数非法 / 权限拒绝
 ToolError(code: ErrorCode, message: str, retryable: bool, tool_call_id: str | None = None)
 ```
+
+**批量入口的调用契约**（编排层 → Runtime）：
+
+```python
+runtime.execute_all(calls, trace) -> list[ToolResult]      # 返回与入参一一对应
+runtime.execute(call, trace)      -> ToolResult
+# calls 元素：{"seq": int, "id", "name", "arguments": dict}
+#             或 {"seq": int, "id", "name", "arguments": None, "parse_error": str}
+```
+
+`seq` 是全局调用序号（跨轮累加），供 Runtime 生成调用级 span 时排序与追溯。
 
 `ErrorCode`：`INVALID_ARGUMENT` / `PERMISSION_DENIED` / `REJECTED_BY_USER` / `TIMEOUT` /
 `UPSTREAM_ERROR` / `NOT_FOUND` / `UNKNOWN`
@@ -107,15 +119,26 @@ ToolError(code: ErrorCode, message: str, retryable: bool, tool_call_id: str | No
 
 ## 七、审计日志（JSONL）
 
-每次工具执行落**一行** JSON（不是 print），字段固定：
+一条记录一行 JSON（不是 print），用 `kind` 区分来源：
+
+| `kind` | 谁写 | 载荷 |
+|---|---|---|
+| `tool` | `ToolRuntime` | `tool` / `args_digest` / `status` / `error_code` / `retryable` / `executed` / `duration_ms` |
+| `reasoning` | 编排层 | `detail.text`（推理内容；默认开，可配开关） |
+| `stream_error` | 编排层 | `detail.planned_calls` / `complete_calls` / `partial_calls` / `error_code` |
+| `stop` | 编排层 | `detail.stop_reason` / `truncated` / `iterations` / `tokens` / `tool_calls` |
 
 ```json
-{"ts":"...","trace_id":"trace-xxxx","span_id":"trace-xxxx:r2","parent_span":"trace-xxxx:r2",
- "tool":"read_file","args_digest":"...","status":"ok|error","error_code":null,
- "retryable":false,"duration_ms":12.3}
+{"kind":"tool","ts":"...","trace_id":"trace-xxxx","span_id":"trace-xxxx:r2","parent_span_id":"...",
+ "tool":"read_file","args_digest":"{\"path\":\"a.txt\"}","status":"ok","error_code":null,
+ "retryable":false,"executed":true,"attempt":1,"duration_ms":12.3,"detail":null}
 ```
 
+`executed` 区分"**执行了但失败**"与"**根本没执行**"（未注册 / 参数非法 / 权限拒绝）——这是两个不同的指标。
+
 写成结构化 JSONL 的唯一理由：**给回归评测消费**。改完 Prompt 跑回归集，能从轨迹里看出是哪一步退化了。
+所以审计要能回答这些数字：产生过几次非法调用、有几个调用是残缺的、推理摘要是什么、为什么终止。
+`AuditLogger.trace_lines(trace_id)` 可按一次任务捞出完整轨迹。
 
 ## 八、事件协议（模块1，已封版）
 
@@ -188,36 +211,72 @@ GLM-5.3-Flash 同一个问题的实测：
 
 ## 九、编排层（模块2）
 
-### 循环由 `stop_reason` 驱动，终止条件有五种
+### 四重预算（单一轮数上限拦不住"20 轮 × 每轮 10 个调用"）
+
+| 优先级 | 预算 | 默认值 | 防什么 |
+|---|---|---|---|
+| 1 | **token 预算** | 200k（从服务端 `Usage` 累计真实值） | 成本失控 |
+| 2 | **轮数上限** | 20 | 轮次打转 |
+| 3 | **工具调用数** | 50 | 单轮巨量 |
+| 4 | **时长** | 300s | 卡死 |
+
+四个预算耗尽后统一用 `stop_reason = "budget_exhausted"`，**具体哪一种由 `AgentResult.detail` 说明**。
+工具调用数预算**先执行再判**——保证 `tool` 消息与其 `assistant` 调用成对，历史不留残缺。
+
+### 终止原因（八种，都是数据不是异常）
 
 | 终止原因 | `stop_reason` | `truncated` | 谁决定下一步 |
 |---|---|---|---|
 | 模型说完了 | `end_turn` | False | — |
 | 模型要调工具 | `tool_use` | — | 执行 → 结果回灌 → 继续循环 |
+| 某种预算耗尽 | `budget_exhausted` | True | 调用方（看 `detail` 区分是哪一种） |
 | 轮数打满 | `max_rounds` | True | 调用方（换模型 / 拆任务 / 转人工） |
 | 原地打转 | `no_progress` | True | 调用方 |
 | 输出被截断 | `max_tokens` | True | 调用方（扩大预算重生成） |
+| 契约未满足 | `output_contract_failed` | True | 调用方（拿原文 + 最后一次校验错误自行降级） |
 | 流内错误 | `error` | True | 调用方（可重试则重试） |
 
-**触顶不抛异常**：跑满轮数是需要优雅收尾的正常情况，不是崩溃。
-**`no_progress` 在编排层判定**（连续 N 轮完全相同的工具调用）——适配器看不到历史，判定不了。
+**触顶不抛异常**：跑满预算是需要优雅收尾的正常情况，不是崩溃。
 
-### 三条容易做错的细节
+### 打转检测：两级指纹 + 二次机会
 
-1. **推理不入历史**：`ReasoningDelta` 只渲染给终端看，**不写进 messages**。
-   推理过程不是对话内容，回传会污染上下文（且部分厂商会直接报错）。
-2. **参数解析的边界**：碎片拼装与 `json.loads` 同属"把碎片变成可用结构"，
-   留在编排层；**语义校验**（必填项、类型、权限、风险）归 `ToolRuntime` 的七职责。
-   参数不是合法 JSON 时不跳过——照常进批次并标 `parse_error`，
-   由 Runtime 产出结构化错误结果：**不派发不等于不记账**。
-3. **错误轮次不入历史**：流内出错的那一轮，半截 assistant 消息**不写进 messages**，
-   否则后面每一轮都带着一条残缺的调用意图。
+| 级 | 指纹 | 触发 |
+|---|---|---|
+| 一级 | `(工具名, 参数)` | 连续 2 轮相同 → **注入提示**，给模型换策略的机会 |
+| 二级 | `(工具名, 参数)` + `(结果前 100 字)` | 连续 3 轮相同 → 确认打转，终止 |
 
-### 渲染是注入的，不是内嵌的
+**只看调用会误判**（外部状态变了，重试是有意义的）；**只看结果也会误判**（不同调用可能返回同样的错误）。
+两级组合才既避免误判、又识别真打转。**打转也是反馈，先提示再终止**——直接终止等于剥夺模型的自我修正机会。
+终止时把重复轮数、指纹、起始轮次写进 `AgentResult.detail` 便于归因。
+
+### 输出契约纠错：独立预算
+
+纠错次数**独立于轮数**（默认 2 次）。共用轮数会造成**归因错误**——
+"模型一直不遵守契约"会表现成 `max_rounds`，看起来像"任务太复杂"，评测时会误判问题来源。
+耗尽后返回 `output_contract_failed` + **原始文本** + 最后一次校验错误（调用方可自行降级）。
+纠错提示必须**指出具体哪里不对**（"字段 X 类型应为 int，实际 str"），不是笼统的"请重新输出"。
+
+### 四条容易做错的细节
+
+1. **推理不入历史，但必须落审计**：`ReasoningDelta` 不写进 messages（推理不是对话内容，
+   回传污染上下文且部分厂商会报错），**但要写审计**——否则这个事件全链路无人消费，等于死事件。
+   审计默认开，可配开关。
+2. **参数解析的边界**：碎片拼装与 `json.loads` 同属"把碎片变成可用结构"，留在编排层；
+   **语义校验**（必填项、类型、权限、风险）归 `ToolRuntime` 的七职责。
+   **Runtime 的输入契约是"结构化的调用"**，`arguments` 必须是 dict——字符串不是它的语言。
+3. **参数不合法也不跳过**：照常进批次并标 `parse_error`，由 Runtime 产出结构化错误结果
+   （`executed=False`）。**不派发不等于不记账**——审计要能回答"模型产生过几次非法调用"。
+   顺带收益：模型连续产生非法调用时指纹相同 → 触发打转检测，不会烧光预算。
+4. **错误轮次不入历史，但审计补记**：流内出错那轮不写半截 assistant 消息（否则后续每轮都带着残缺的调用意图），
+   但**审计要记下"这轮产出了 N 个调用（完整 x 个 / 残缺 y 个）"**——不写历史是"不污染上下文"，
+   记审计是"信息不丢"，两者不矛盾。
+
+### 跨层纪律：渲染注入，不硬编码
 
 编排层不 `print`，渲染走注入的 `Renderer`（`text` / `reasoning` / `notice` 三个动作）。
 终端要打字机、日志要纯文本、将来接 UI 要事件——渲染注定多变，焊死在编排层等于把展示方式写进业务逻辑。
-测试里注入记录用的渲染器，就能断言"循环说了什么"而不必捕获 stdout。
+**这条纪律和"客户端不 print"是同一条**：全链路没有任何一层知道"怎么显示"。
+工程收益也是实的：测试注入 `NullRenderer`，断言不被 stdout 干扰，113 个用例 0.2 秒跑完。
 
 ## 十、明确不做（写清"什么条件下才做"）
 

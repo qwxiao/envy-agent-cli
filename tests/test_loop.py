@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from envy_agent_cli.audit.logger import AuditLogger
 from envy_agent_cli.llm.events import (
     Error,
     LLMErrorCode,
@@ -19,7 +20,18 @@ from envy_agent_cli.llm.events import (
 )
 from envy_agent_cli.llm.params import ChatParams
 from envy_agent_cli.llm.validator import OutputContract
-from envy_agent_cli.loop.react import MAX_ROUNDS, NO_PROGRESS_LIMIT, run
+from envy_agent_cli.loop.react import (
+    NO_PROGRESS_HINT,
+    STOP_BUDGET,
+    STOP_CONTRACT_FAILED,
+    STOP_ERROR,
+    STOP_MAX_ROUNDS,
+    STOP_MAX_TOKENS,
+    STOP_NO_PROGRESS,
+    Budget,
+    NoProgressPolicy,
+    run,
+)
 from envy_agent_cli.loop.renderer import NullRenderer
 from envy_agent_cli.tools.result import ToolResult
 
@@ -64,6 +76,7 @@ class FakeRuntime:
     results: list[str] = field(default_factory=lambda: ["ok"])
     calls: list[list] = field(default_factory=list)
     traces: list = field(default_factory=list)
+    executed_flags: list[bool] = field(default_factory=list)
 
     def execute_all(self, calls, trace):
         self.calls.append(calls)
@@ -72,10 +85,11 @@ class FakeRuntime:
         for i, call in enumerate(calls):
             if call.get("parse_error"):
                 out.append(ToolResult(content=f"参数不是合法 JSON：{call['parse_error']}",
-                                      is_error=True, tool_call_id=call["id"]))
+                                      is_error=True, tool_call_id=call["id"], executed=False))
             else:
-                content = self.results[i % len(self.results)]
-                out.append(ToolResult(content=content, tool_call_id=call["id"]))
+                out.append(ToolResult(content=self.results[i % len(self.results)],
+                                      tool_call_id=call["id"]))
+        self.executed_flags.append(all(not r.is_error or r.executed for r in out))
         return out
 
 
@@ -98,20 +112,23 @@ def call_deltas(index: int, name: str, arguments: str, call_id: str | None = Non
     ]
 
 
-def bare_question_result(**kwargs):
-    """跑一次任务，返回 (结果, 渲染器, 适配器, 执行器)。"""
-    adapter = kwargs.pop("adapter")
+def tool_round(name: str = "list_dir", arguments: str = '{"path": "."}', index: int = 0) -> list:
+    return [*call_deltas(index, name, arguments), end("tool_use")]
+
+
+def run_once(adapter, **kwargs):
+    """跑一次任务，返回 (结果, 渲染器, 执行器)。"""
     runtime = kwargs.pop("runtime", FakeRuntime())
     renderer = kwargs.pop("render", RecordingRenderer())
-    return run("帮我看看", adapter=adapter, runtime=runtime, render=renderer, **kwargs), \
-        renderer, adapter, runtime
+    result = run("帮我看看", adapter=adapter, runtime=runtime, render=renderer, **kwargs)
+    return result, renderer, runtime
 
 
 # ---------------------------------------------------------------- 主流程
 
 def test_single_round_path():
     adapter = FakeAdapter([[text("你好"), end()]])
-    result, renderer, _, runtime = bare_question_result(adapter=adapter)
+    result, _, runtime = run_once(adapter)
 
     assert result.text == "你好" and result.iterations == 1
     assert result.truncated is False and result.stop_reason == "end_turn"
@@ -125,16 +142,27 @@ def test_tool_round_then_answer():
         [text("我先看目录。"), *call_deltas(0, "list_dir", '{"path": "."}'), end("tool_use")],
         [text("目录里有 a.txt。"), end()],
     ])
-    result, _, _, runtime = bare_question_result(adapter=adapter)
+    result, _, runtime = run_once(adapter)
 
     assert result.text == "目录里有 a.txt。" and result.iterations == 2
     assert [m["role"] for m in result.messages] == ["user", "assistant", "tool", "assistant"]
     assert result.messages[1]["content"] == "我先看目录。"
     assert result.messages[1]["tool_calls"][0]["function"]["name"] == "list_dir"
     assert result.messages[2]["tool_call_id"] == "call_0"
+    assert runtime.calls[0][0]["arguments"] == {"path": "."}
 
-    # 执行走的是 Runtime，且拿到的是解析后的 dict 参数
-    assert runtime.calls == [[{"id": "call_0", "name": "list_dir", "arguments": {"path": "."}}]]
+
+def test_batch_entries_carry_seq():
+    """`seq` 是全局调用序号——Runtime 生成调用级 span 时要靠它排序。"""
+    adapter = FakeAdapter([
+        [*call_deltas(0, "list_dir", "{}"), *call_deltas(1, "read_file", "{}"), end("tool_use")],
+        [*call_deltas(0, "list_dir", "{}"), end("tool_use")],
+        [text("done"), end()],
+    ])
+    _, _, runtime = run_once(adapter)
+
+    assert [c["seq"] for c in runtime.calls[0]] == [0, 1]
+    assert [c["seq"] for c in runtime.calls[1]] == [2]      # 第二轮接着数，不重置
 
 
 def test_arguments_are_assembled_from_fragments_before_execution():
@@ -143,8 +171,7 @@ def test_arguments_are_assembled_from_fragments_before_execution():
         [*call_deltas(0, "read_file", '{"path": "a.txt"}'), end("tool_use")],
         [text("读完了"), end()],
     ])
-    _, _, _, runtime = bare_question_result(adapter=adapter)
-
+    _, _, runtime = run_once(adapter)
     assert runtime.calls[0][0]["arguments"] == {"path": "a.txt"}
 
 
@@ -154,10 +181,11 @@ def test_multiple_tool_calls_in_one_round_are_all_executed():
          end("tool_use")],
         [text("done"), end()],
     ])
-    result, _, _, runtime = bare_question_result(adapter=adapter)
+    result, _, runtime = run_once(adapter)
 
     assert [c["name"] for c in runtime.calls[0]] == ["list_dir", "read_file"]
     assert [m["role"] for m in result.messages] == ["user", "assistant", "tool", "tool", "assistant"]
+    assert result.tool_calls_total == 2
 
 
 def test_tool_error_result_is_fed_back_not_raised():
@@ -166,8 +194,7 @@ def test_tool_error_result_is_fed_back_not_raised():
         [*call_deltas(0, "write_file", '{"path": "a.txt"}'), end("tool_use")],
         [text("写不了，我换个办法。"), end()],
     ])
-    runtime = FakeRuntime(results=["权限不足"])
-    result, _, _, _ = bare_question_result(adapter=adapter, runtime=runtime)
+    result, _, _ = run_once(adapter, runtime=FakeRuntime(results=["权限不足"]))
 
     assert result.messages[2]["content"] == "权限不足"
     assert result.iterations == 2
@@ -179,73 +206,164 @@ def test_malformed_arguments_are_dispatched_as_marked_entry():
         [*call_deltas(0, "read_file", "{这不是 JSON"), end("tool_use")],
         [text("我改一下调用方式。"), end()],
     ])
-    result, _, _, runtime = bare_question_result(adapter=adapter)
+    result, _, runtime = run_once(adapter)
 
     entry = runtime.calls[0][0]
     assert entry["arguments"] is None and entry["parse_error"]
     assert "不是合法 JSON" in result.messages[2]["content"]
 
 
-# ---------------------------------------------------------------- 终止条件
+# ---------------------------------------------------------------- 四重预算
 
-def test_max_rounds_reached_is_graceful():
-    """触顶不抛异常：标记 truncated，把已有内容作为结论返回。
+def test_max_rounds_budget():
+    """每轮调用故意不同——否则会先被 no_progress 拦下，测不到触顶这条路径。"""
+    adapter = FakeAdapter([tool_round(arguments=f'{{"path": "{i}"}}') for i in range(10)])
+    result, renderer, _ = run_once(adapter, budget=Budget(max_rounds=3))
 
-    每轮调用**故意不同**——否则会先被 no_progress 拦下，测不到触顶这条路径。
-    """
-    rounds = [[*call_deltas(0, "list_dir", f'{{"path": "{i}"}}'), end("tool_use")]
-              for i in range(MAX_ROUNDS + 1)]
-    adapter = FakeAdapter(rounds)
-    result, renderer, _, _ = bare_question_result(adapter=adapter, max_rounds=3)
-
-    assert result.truncated is True
-    assert result.stop_reason == "max_rounds"
-    assert result.iterations == 3
-    assert any("轮数上限" in n for n in renderer.notices)
+    assert result.truncated is True and result.stop_reason == STOP_MAX_ROUNDS
+    assert result.iterations == 3 and "轮数上限" in (result.detail or "")
 
 
-def test_no_progress_detection_stops_early():
-    """连续多轮完全相同的调用 = 原地打转，提前收尾（不必等到轮数上限）。"""
-    same_round = [*call_deltas(0, "list_dir", '{"path": "."}'), end("tool_use")]
-    adapter = FakeAdapter([same_round] * (NO_PROGRESS_LIMIT + 2))
-    result, renderer, _, _ = bare_question_result(adapter=adapter)
-
-    assert result.stop_reason == "no_progress"
-    assert result.truncated is True
-    assert result.iterations == NO_PROGRESS_LIMIT
-    assert result.iterations < MAX_ROUNDS, "应当在触顶之前就被拦下"
-    assert any("原地打转" in n for n in renderer.notices)
-
-
-def test_different_calls_do_not_trigger_no_progress():
-    """每轮调用不同就不算打转——检测的是"完全相同"。"""
+def test_token_budget_stops_before_burning_another_round():
     adapter = FakeAdapter([
-        [*call_deltas(0, "list_dir", '{"path": "a"}'), end("tool_use")],
-        [*call_deltas(0, "list_dir", '{"path": "b"}'), end("tool_use")],
-        [*call_deltas(0, "list_dir", '{"path": "c"}'), end("tool_use")],
-        [text("ok"), end()],
+        [*call_deltas(0, "list_dir", f'{{"path": "{i}"}}'), Usage(0, 0, 100), end("tool_use")]
+        for i in range(5)
     ])
-    result, _, _, _ = bare_question_result(adapter=adapter)
+    result, _, _ = run_once(adapter, budget=Budget(max_tokens=150))
 
-    assert result.stop_reason == "end_turn" and result.iterations == 4
+    assert result.stop_reason == STOP_BUDGET and result.truncated is True
+    assert "token 预算" in (result.detail or "")
+    assert result.usage.total_tokens >= 150
 
+
+def test_tool_call_budget_stops_after_paired_round():
+    """工具调用数预算：先执行再判——保证 tool 消息与 assistant 调用成对，历史不残缺。"""
+    adapter = FakeAdapter([tool_round(index=i) if False else [
+        *call_deltas(0, "list_dir", f'{{"path": "{n}"}}'),
+        *call_deltas(1, "read_file", f'{{"path": "{n}"}}'),
+        end("tool_use")] for n in range(5)])
+    result, _, runtime = run_once(adapter, budget=Budget(max_tool_calls=2))
+
+    assert result.stop_reason == STOP_BUDGET and "工具调用数预算" in (result.detail or "")
+    assert result.tool_calls_total == 2
+    assert [m["role"] for m in result.messages].count("tool") == 2      # 调用与结果成对
+
+
+def test_duration_budget():
+    adapter = FakeAdapter([tool_round()])
+    result, _, _ = run_once(adapter, budget=Budget(max_duration_s=-1))
+
+    assert result.stop_reason == STOP_BUDGET and "时长预算" in (result.detail or "")
+
+
+# ---------------------------------------------------------------- 打转检测（两级）
+
+def test_no_progress_two_level_detection():
+    """连续 3 轮"调用 + 结果"都相同 → 终止；第 2 轮先注入提示给模型一次机会。"""
+    adapter = FakeAdapter([tool_round()] * 5)
+    result, renderer, _ = run_once(adapter)
+
+    assert result.stop_reason == STOP_NO_PROGRESS and result.truncated is True
+    assert result.iterations == 3
+    assert any(m.get("content") == NO_PROGRESS_HINT for m in result.messages), "第 2 轮应先提示"
+    assert any("原地打转" in n for n in renderer.notices)
+    assert "重复 3 轮" in (result.detail or "")
+
+
+def test_repeated_calls_with_changing_results_only_warns():
+    """调用相同但结果在变（外部状态变了）→ 只提示，不终止：这是两级指纹的意义。"""
+    class ChangingRuntime(FakeRuntime):
+        def execute_all(self, calls, trace):
+            self.results = [f"结果-{len(self.calls)}"]
+            return super().execute_all(calls, trace)
+
+    adapter = FakeAdapter([tool_round()] * 6)
+    result, _, _ = run_once(adapter, runtime=ChangingRuntime(), budget=Budget(max_rounds=4))
+
+    assert result.stop_reason == STOP_MAX_ROUNDS, "结果在变就不该判打转"
+    assert any(m.get("content") == NO_PROGRESS_HINT for m in result.messages)
+
+
+def test_different_calls_never_trigger_no_progress():
+    adapter = FakeAdapter([tool_round(arguments=f'{{"path": "{i}"}}') for i in range(4)]
+                          + [[text("ok"), end()]])
+    result, _, _ = run_once(adapter)
+
+    assert result.stop_reason == "end_turn" and result.iterations == 5
+
+
+def test_no_progress_policy_is_configurable():
+    adapter = FakeAdapter([tool_round()] * 6)
+    result, _, _ = run_once(adapter, no_progress=NoProgressPolicy(warn_after=1, stop_after=2))
+
+    assert result.stop_reason == STOP_NO_PROGRESS and result.iterations == 2
+
+
+# ---------------------------------------------------------------- 其他终止
 
 def test_stream_error_ends_task_without_polluting_history():
     """流内错误：不把半截 assistant 消息写进历史，否则后续每一轮都被污染。"""
     adapter = FakeAdapter([[text("说到一半"), Error("连接断开", LLMErrorCode.SERVER_ERROR, True)]])
-    result, renderer, _, _ = bare_question_result(adapter=adapter)
+    result, renderer, _ = run_once(adapter)
 
-    assert result.stop_reason == "error" and result.truncated is True
+    assert result.stop_reason == STOP_ERROR and result.truncated is True
     assert [m["role"] for m in result.messages] == ["user"]
     assert any("server_error" in n for n in renderer.notices)
 
 
 def test_max_tokens_is_treated_as_incomplete():
     adapter = FakeAdapter([[text("被截断的半句"), end("max_tokens")]])
-    result, renderer, _, _ = bare_question_result(adapter=adapter)
+    result, renderer, _ = run_once(adapter)
 
-    assert result.truncated is True and result.stop_reason == "max_tokens"
+    assert result.truncated is True and result.stop_reason == STOP_MAX_TOKENS
     assert any("截断" in n for n in renderer.notices)
+
+
+# ---------------------------------------------------------------- 输出契约纠错（独立预算）
+
+CONTRACT = OutputContract("answer", {"type": "object", "required": ["summary"]})
+
+
+def test_invalid_output_triggers_correction_round():
+    """validator 只产提示，**再发一次请求的是 Loop**。"""
+    adapter = FakeAdapter([
+        [text("我随便说说"), end()],
+        [text('{"summary": "合规了"}'), end()],
+    ])
+    result, renderer, _ = run_once(adapter, output_contract=CONTRACT)
+
+    assert result.text == '{"summary": "合规了"}' and result.iterations == 2
+    assert result.messages[2]["role"] == "user" and "answer" in result.messages[2]["content"]
+    assert any("重试" in n for n in renderer.notices)
+
+
+def test_valid_output_does_not_trigger_correction():
+    adapter = FakeAdapter([[text('{"summary": "ok"}'), end()]])
+    result, _, _ = run_once(adapter, output_contract=CONTRACT)
+
+    assert result.iterations == 1
+    assert [m["role"] for m in result.messages] == ["user", "assistant"]
+
+
+def test_correction_has_independent_budget():
+    """纠错走独立预算：耗尽后归因为"契约不满足"，**不能表现成 max_rounds**（那是归因错误）。"""
+    adapter = FakeAdapter([[text('{"other": 1}'), end()]])       # 合法 JSON 但缺必填字段
+    result, _, _ = run_once(adapter, output_contract=CONTRACT, max_corrections=2,
+                            budget=Budget(max_rounds=20))
+
+    assert result.stop_reason == STOP_CONTRACT_FAILED and result.truncated is True
+    assert result.iterations == 3          # 1 次原始 + 2 次纠错，用满即停
+    assert result.iterations < 20, "不该把轮数烧光"
+    assert "summary" in (result.detail or ""), "detail 要带最后一次校验错误"
+
+
+def test_correction_prompt_points_at_the_specific_error():
+    """纠错提示必须指出**具体哪里不对**，不能只是笼统的"请重新输出"。"""
+    adapter = FakeAdapter([[text('{"other": 1}'), end()], [text('{"summary": "ok"}'), end()]])
+    result, _, _ = run_once(adapter, output_contract=CONTRACT)
+
+    hint = result.messages[2]["content"]
+    assert "summary" in hint and "必填" in hint
 
 
 # ---------------------------------------------------------------- 上下文与追踪
@@ -253,7 +371,7 @@ def test_max_tokens_is_treated_as_incomplete():
 def test_reasoning_is_rendered_but_not_archived():
     """思维链只在终端显示，不进 messages——推理过程不是对话内容。"""
     adapter = FakeAdapter([[ReasoningDelta("让我想想……"), text("答案是 42"), end()]])
-    result, renderer, _, _ = bare_question_result(adapter=adapter)
+    result, renderer, _ = run_once(adapter)
 
     assert renderer.reasonings == ["让我想想……"]
     assert result.messages[1]["content"] == "答案是 42"
@@ -261,11 +379,8 @@ def test_reasoning_is_rendered_but_not_archived():
 
 
 def test_trace_is_generated_and_passed_down():
-    adapter = FakeAdapter([
-        [*call_deltas(0, "list_dir", "{}"), end("tool_use")],
-        [text("ok"), end()],
-    ])
-    result, _, _, runtime = bare_question_result(adapter=adapter)
+    adapter = FakeAdapter([tool_round(), [text("ok"), end()]])
+    result, _, runtime = run_once(adapter)
 
     task_trace = adapter.calls[0]["trace"]
     assert task_trace.trace_id == result.trace_id and task_trace.trace_id.startswith("trace-")
@@ -275,53 +390,96 @@ def test_trace_is_generated_and_passed_down():
 
     tool_trace = runtime.traces[0]
     assert tool_trace.trace_id == result.trace_id
-    assert tool_trace.parent_span_id == f"{result.trace_id}:r1"    # 父级是它所属的轮次
+    assert tool_trace.parent_span_id == f"{result.trace_id}:r1"
 
 
 def test_usage_and_params_flow_through():
     adapter = FakeAdapter([[text("hi"), Usage(10, 5, 15), end()]])
-    bare_question_result(adapter=adapter, params=ChatParams(temperature=0.1), tool_schemas=[{"x": 1}])
+    result, _, _ = run_once(adapter, params=ChatParams(temperature=0.1), tool_schemas=[{"x": 1}])
 
     assert adapter.calls[0]["params"].temperature == 0.1
     assert adapter.calls[0]["tools"] == [{"x": 1}]
+    assert result.usage.total_tokens == 15
 
 
-# ---------------------------------------------------------------- 输出契约纠错
+# ---------------------------------------------------------------- 审计
 
-def test_invalid_output_triggers_one_correction_round():
-    """validator 只产提示，**再发一次请求的是 Loop**。"""
-    contract = OutputContract("answer", {"type": "object", "required": ["summary"]})
-    adapter = FakeAdapter([
-        [text("我随便说说"), end()],                      # 不合契约
-        [text('{"summary": "合规了"}'), end()],            # 补一次就合规
-    ])
-    result, renderer, _, _ = bare_question_result(adapter=adapter, output_contract=contract)
+def test_reasoning_is_audited(tmp_path):
+    """推理不入历史，但必须落审计——否则 ReasoningDelta 事件就是个死事件。"""
+    logger = AuditLogger(tmp_path / "audit.jsonl")
+    adapter = FakeAdapter([[ReasoningDelta("推理内容在此"), text("答"), end()]])
+    result, _, _ = run_once(adapter, audit=logger)
 
-    assert result.text == '{"summary": "合规了"}' and result.iterations == 2
-    correction = result.messages[2]
-    assert correction["role"] == "user" and "answer" in correction["content"]
-    assert any("重试" in n for n in renderer.notices)
+    records = logger.trace_lines(result.trace_id)
+    reasoning = [r for r in records if r.kind == "reasoning"]
+    assert reasoning and reasoning[0].detail["text"] == "推理内容在此"
+    assert logger.trace_lines(result.trace_id)
 
 
-def test_valid_output_does_not_trigger_correction():
-    contract = OutputContract("answer", {"type": "object", "required": ["summary"]})
-    adapter = FakeAdapter([[text('{"summary": "ok"}'), end()]])
-    result, _, _, _ = bare_question_result(adapter=adapter, output_contract=contract)
+def test_reasoning_audit_can_be_disabled(tmp_path):
+    logger = AuditLogger(tmp_path / "audit.jsonl")
+    adapter = FakeAdapter([[ReasoningDelta("推理"), text("答"), end()]])
+    run_once(adapter, audit=logger, audit_reasoning=False)
 
-    assert result.iterations == 1
-    assert [m["role"] for m in result.messages] == ["user", "assistant"]
+    assert not [r for r in logger.trace_lines("") if r.kind == "reasoning"]
+    assert not [r for r in logger.trace_lines(
+        adapter.calls[0]["trace"].trace_id) if r.kind == "reasoning"]
+
+
+def test_stream_error_audit_records_call_counts(tmp_path):
+    """出错轮次要记得住"产出了几个调用、几个是残缺的"——信息不丢，只是不入历史。"""
+    logger = AuditLogger(tmp_path / "audit.jsonl")
+    adapter = FakeAdapter([[
+        ToolCallDelta(index=0, is_first=True, call_id="c0", name="list_dir", arguments="{}"),
+        ToolCallDelta(index=1, is_first=True, call_id="c1", name="read_file", arguments="{残缺"),
+        Error("断了", LLMErrorCode.SERVER_ERROR, True),
+    ]])
+    result, _, _ = run_once(adapter, audit=logger)
+
+    event = [r for r in logger.trace_lines(result.trace_id) if r.kind == "stream_error"][0]
+    assert event.detail["planned_calls"] == 2
+    assert event.detail["partial_calls"] == 1
+    assert event.detail["error_code"] == "server_error"
+
+
+def test_stop_event_is_audited(tmp_path):
+    logger = AuditLogger(tmp_path / "audit.jsonl")
+    adapter = FakeAdapter([[text("答"), end()]])
+    result, _, _ = run_once(adapter, audit=logger)
+
+    stop = [r for r in logger.trace_lines(result.trace_id) if r.kind == "stop"]
+    assert stop and stop[0].detail["stop_reason"] == "end_turn"
+    assert stop[0].detail["tool_calls"] == 0
+
+
+def test_audit_logger_is_jsonl_and_filterable(tmp_path):
+    logger = AuditLogger(tmp_path / "audit.jsonl")
+    adapter = FakeAdapter([tool_round(), [text("ok"), end()]])
+    result, _, _ = run_once(adapter, audit=logger)
+
+    raw = (tmp_path / "audit.jsonl").read_text(encoding="utf8")
+    assert raw.count("\n") == len(logger.trace_lines(result.trace_id))
+
+    import json
+    assert json.loads(raw.splitlines()[0])["trace_id"] == result.trace_id
+    assert logger.trace_lines("别的 trace") == []
 
 
 # ---------------------------------------------------------------- 边界守卫
 
 def test_loop_does_not_print():
-    """渲染必须走注入的 Renderer——编排层里出现 print，就等于把展示方式焊进业务逻辑。"""
+    """渲染必须走注入的 Renderer——编排层里出现 print，就等于把展示方式焊进业务逻辑。
+
+    用 AST 找真正的调用（字符串匹配会把 `_results_fingerprint(` 这种名字误判成 print）。
+    """
+    import ast
     from pathlib import Path
-    source = Path(__file__).resolve().parents[1] / "src" / "envy_agent_cli" / "loop" / "react.py"
-    code_lines = [ln for ln in source.read_text(encoding="utf8").splitlines()
-                  if ln.strip() and not ln.strip().startswith("#")]
-    # 允许文档字符串里出现 print 这个词，但不允许真的调用
-    assert not [ln for ln in code_lines if "print(" in ln]
+
+    source = (Path(__file__).resolve().parents[1] / "src" / "envy_agent_cli"
+              / "loop" / "react.py").read_text(encoding="utf8")
+    calls = [n for n in ast.walk(ast.parse(source))
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "print"]
+    assert not calls, "编排层不允许直接打印"
 
 
 def test_renderer_protocol_is_satisfied_by_default_implementations():
@@ -331,11 +489,9 @@ def test_renderer_protocol_is_satisfied_by_default_implementations():
         assert isinstance(impl, Renderer)
 
 
-@pytest.mark.parametrize("limit", [1, 2])
-def test_no_progress_limit_is_configurable(limit):
-    same_round = [*call_deltas(0, "list_dir", "{}"), end("tool_use")]
-    adapter = FakeAdapter([same_round] * 5)
-    result, _, _, _ = bare_question_result(adapter=adapter, no_progress_limit=limit)
-
-    assert any(result.stop_reason == expected
-               for expected in ("no_progress", "max_rounds"))
+@pytest.mark.parametrize("stop_after", [2, 3])
+def test_no_progress_threshold_boundary(stop_after):
+    adapter = FakeAdapter([tool_round()] * 6)
+    result, _, _ = run_once(adapter, no_progress=NoProgressPolicy(warn_after=1,
+                                                                  stop_after=stop_after))
+    assert result.iterations == stop_after
