@@ -9,7 +9,7 @@ messages 是模型的**唯一记忆**——模型无状态，每轮全量重发�
 - **切分红线：保住工具组完整**——不能让 `tool` 消息与它的 `assistant` 调用请求被切开，
   否则会出现孤儿 `tool_call_id`，API 直接 400。
 
-接口在 M2 之前定，本文件暂不封版。
+接口尚未封版，本文件暂为占位。
 """
 
 from dataclasses import dataclass
@@ -44,7 +44,7 @@ class ContextWindowManager:
         self.budget = budget
 
     def prepare(self, messages: list[dict], tool_definitions: list[dict] | None = None) -> PrepareResult:
-        """检查并（必要时）压缩。接口待定，M2 前封版。"""
+        """检查并（必要时）压缩。接口待定。"""
         raise NotImplementedError("接口待定")
 
 

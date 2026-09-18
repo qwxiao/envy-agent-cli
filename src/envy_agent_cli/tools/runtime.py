@@ -110,7 +110,7 @@ class ToolRuntime:
     def _audit(self, tool: RegisteredTool, args: dict, status: str, trace: TraceContext, **extra) -> None:
         """职责 6 · 审计。**每次执行落一条结构化 JSONL**，用 trace_id 串起来。
 
-        这不是"日志好看"——它是 M6 评测的 Trajectory 原始数据源。
+        这不是"日志好看"——它是回归评测的 Trajectory 原始数据源。
         """
         raise NotImplementedError
 

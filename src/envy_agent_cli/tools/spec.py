@@ -10,7 +10,7 @@ Tool = 声明层（ToolSpec：可序列化 / 可审计 / 可给模型看）
 
 七字段的落地顺序（见 ARCHITECTURE.md 第四节）：
 - 🔴 第一批（现在）：`name` `description` `input_model` `permission` `risk`
-- 🟡 第二批（M2 结果归一化时）：`output_model` `error_model`
+- 🟡 第二批（随结果归一化一起做）：`output_model` `error_model`
 - ⚪ 不进字段：`handler`（它不属于 schema 层）
 """
 
@@ -32,9 +32,9 @@ class Risk(str, Enum):
 class Permission:
     """工具的权限声明。
 
-    ⚠️ **语义按本项目改写**：课程里 `permission` 是用户权限（`order:read`），
-    但我们这个 CLI 是**单人工具、没有多用户体系**，所以它的语义是
-    "**能操作哪些工作区路径**"——一份路径白名单。别照抄课程语义。
+    ⚠️ **语义按本项目改写**：多用户系统里它通常是用户权限（`order:read`），
+    但这个 CLI 是**单人工具、没有多用户体系**，所以语义是
+    "**能操作哪些工作区路径**"——一份路径白名单。
 
     Runtime 只**执行**这份策略，不替业务方**定义**策略。
     """

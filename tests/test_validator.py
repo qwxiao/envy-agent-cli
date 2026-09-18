@@ -54,7 +54,7 @@ def test_enum_violation_fails():
 
 
 def test_business_rules_are_not_checked_here():
-    """路径白名单、跨字段业务语义这类"需要懂业务"的校验归上层，M1 不管。"""
+    """路径白名单、跨字段业务语义这类"需要懂业务"的校验归上层，本层不管。"""
     contract = OutputContract("fs", {"type": "object", "required": ["path"],
                                      "properties": {"path": {"type": "string"}}})
     assert validate_output('{"path": "../../.env"}', contract).ok is True

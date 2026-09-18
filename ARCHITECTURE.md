@@ -2,9 +2,6 @@
 
 > **封版原则：接口封死，实现可迭代。**
 > 本文档里的接口一旦签字，后续只允许"填实现"，不允许改签名。要改签名必须走一次显式的解封记录。
->
-> 设计来源：WorkBuddy 侧 2026-09-17 产出的《模块3-ToolRuntime 职责边界表》《M2 任务升级：从注册表到 ToolRuntime》，
-> 以及 Harness 六层架构与四角色边界。**本项目的框架以 WorkBuddy 侧设计为准。**
 
 ---
 
@@ -37,7 +34,8 @@ VENDOR STREAM → MODEL ADAPTER → AGENT LOOP → EVENT STORE → SSE GATEWAY �
 | **Tool Runtime** | 查找、校验、鉴权、超时、重试、审计、归一化 | ❌ 不能替业务方定义权限和风险规则 |
 | Agent Loop | 保存消息与状态、把 Tool Result 送回模型、决定继续或结束 | ❌ **不应绕过 Runtime 直接调用业务函数** |
 
-> 金句（面试口径）：**模型返回的 Tool Call 只是一个候选动作，它与用户输入一样，都属于不可信数据。**
+> **模型返回的 Tool Call 只是一个候选动作，它与用户输入一样，都属于不可信数据。**
+> 这句话解释了为什么必须有 Runtime——模型只能"提议"，不能"下令"。
 
 ## 三、三个契约（解耦的确切含义 = 不同消费者看到不同信息面）
 
@@ -63,11 +61,12 @@ VENDOR STREAM → MODEL ADAPTER → AGENT LOOP → EVENT STORE → SSE GATEWAY �
 | 批次 | 字段 | 何时加 | 理由 |
 |---|---|---|---|
 | 🔴 第一批 | `name` `description` `input_model` `permission` `risk` | 现在 | 直接对应 Runtime 职责；`risk` 用来替代原来的单 bool `requires_approval` |
-| 🟡 第二批 | `output_model` `error_model` | M2 结果归一化时 | 要配合返回值从 `str` 改成结构化 `ToolResult`（破坏性改动） |
+| 🟡 第二批 | `output_model` `error_model` | 随结果归一化一起做 | 要配合返回值从 `str` 改成结构化 `ToolResult`（破坏性改动） |
 | ⚪ 不进字段 | `handler` | — | 属**实现层**，不是 schema 层；模型永远看不到 |
 
-**`permission` 语义按本项目改写**：课程例子是用户权限 `order:read`，我们是单人 CLI、没有多用户体系，
-所以它的语义是 **"能操作哪些工作区路径"**（路径白名单），不是"哪个用户能调"。
+**`permission` 语义按本项目改写**：多用户系统里它通常是用户权限（`order:read`），
+但本项目是单人 CLI、没有多用户体系，所以语义是 **"能操作哪些工作区路径"**（路径白名单），
+不是"哪个用户能调"。
 
 ```
 Tool = 声明层（ToolSpec：可序列化 / 可审计 / 可给模型看）
@@ -91,7 +90,7 @@ ToolError(code: ErrorCode, message: str, retryable: bool, tool_call_id: str | No
 **三份 Schema 不可合并**：input 拦错误调用 / output 固定成功事实 / error 驱动失败恢复。
 缺一个，Loop 就得解析自然语言或猜下一步——而 Loop 的天职是**确定性编排**，一旦要"猜"就退化成另一个 LLM。
 
-> 前提提醒（面试高级形态）：这个结论只在**输出要被程序消费**时成立；只给人看时不需要这么严。
+> 前提提醒：这个结论只在**输出要被程序消费**时成立；如果输出只给人看，确实不需要这么严。
 
 ## 六、链路追踪：三级粒度（P0）
 
@@ -104,7 +103,7 @@ ToolError(code: ErrorCode, message: str, retryable: bool, tool_call_id: str | No
 **为什么分三级**：粒度不对就没法归因——只看 trace 不知道哪一轮出的问题，只看轮次分不清是模型的错还是工具的错。
 分级之后一次失败能精确落到"第 3 轮第 2 个工具调用"。
 
-**这是 M6 评测的地基**：trace 串起来的审计日志 = Trajectory = 评测数据源。没有 trace 就没有评测。
+**这是回归评测的地基**：trace 串起来的审计日志 = Trajectory = 评测数据源。没有 trace 就没有轨迹级的评测。
 
 ## 七、审计日志（JSONL）
 
@@ -116,7 +115,7 @@ ToolError(code: ErrorCode, message: str, retryable: bool, tool_call_id: str | No
  "retryable":false,"duration_ms":12.3}
 ```
 
-写成结构化 JSONL 的唯一理由：**给 M6 的评测消费**。改完 Prompt 跑回归集，能从轨迹里看出是哪一步退化了。
+写成结构化 JSONL 的唯一理由：**给回归评测消费**。改完 Prompt 跑回归集，能从轨迹里看出是哪一步退化了。
 
 ## 八、事件协议（模块1，已封版）
 
@@ -158,7 +157,7 @@ Error(message, code, retryable, status_code)        # 连异常都是数据
 流式重试的硬约束：**只有"还没吐出任何事件就失败"才允许重试**——流吐了一半再重来，
 上层会收到重复正文/工具碎片（等价于"非幂等操作盲目重试"）。
 
-### 输出契约层（决策8 已落地）
+### 输出契约层
 
 `llm/validator.py`：① 定义输出契约 ② 结构校验 ③ 生成纠错提示文本。
 **纠错重试由 Loop 驱动**——validator 自己不发起请求，保持"模块1 不决策"的边界。
@@ -173,5 +172,5 @@ Error(message, code, retryable, status_code)        # 连异常都是数据
 | 背压 | ❌ 不做 | 同步生成器 + 单客户端天然跟得上。留注释：未来接多客户端需在 SSE 写入层加队列 + 水位控制 |
 | 独立 Gateway / Event Store | ❌ 不做 | 单进程 CLI 不需要；出现多应用共享 / 多租户 / 统一密钥路由计费时才拆 |
 | `ProviderSwitch` 事件 | ❌ 不加 | 换厂商是工厂内部决策。暴露后上层会写出 `if provider == ...`，等于依赖实现细节 |
-| MCP 工具接入 | M2 | 外部 MCP 工具与内置工具走**同一个执行入口**（`ToolRuntime.execute`），届时不改 Loop、不改 Runtime |
-| 摘要压缩器（模块4） | M2 前定接口 | 目录占位 |
+| MCP 工具接入 | 后续 | 外部 MCP 工具与内置工具走**同一个执行入口**（`ToolRuntime.execute`），届时不改 Loop、不改 Runtime |
+| 摘要压缩器（模块4） | 接口待定 | 目录占位 |
