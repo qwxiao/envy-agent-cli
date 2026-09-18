@@ -179,6 +179,8 @@ def test_no_reverse_layer_dependency():
         "llm": ("loop", "tools", "context", "audit"),
         "tools": ("loop",),
         "context": ("loop",),
+        "audit": ("loop", "tools"),        # 审计是旁路，不该反过来依赖业务层
+        "loop": (),                       # 顶层编排：没有"上层"可依赖
     }
     for layer, forbidden in rules.items():
         for path in (SRC / layer).rglob("*.py"):

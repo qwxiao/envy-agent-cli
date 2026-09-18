@@ -40,6 +40,7 @@ class AuditRecord:
 
     # —— kind="tool" 用 ——
     tool: str | None = None
+    seq: int | None = None                   # 全局调用序号：并发执行时靠它还原真实调用次序
     args_digest: str | None = None
     status: str = "ok"                       # ok | error
     error_code: str | None = None

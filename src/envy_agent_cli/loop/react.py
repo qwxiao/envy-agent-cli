@@ -114,6 +114,7 @@ def run(
     tool_schemas: list[dict] | None = None,
     render: Renderer | None = None,
     params: ChatParams | None = None,
+    system_prompt: str | None = None,
     budget: Budget | None = None,
     no_progress: NoProgressPolicy | None = None,
     max_corrections: int = 2,
@@ -125,6 +126,10 @@ def run(
 
     依赖全部由参数注入（不在模块顶层 new 全局对象）——这样测试可以塞 FakeAdapter / FakeRuntime，
     也让"换模型不改 Loop"在代码层面成立。
+
+    Args:
+        system_prompt: 可选的系统提示。**注入防护第 1 级的"声明"那一半就落在这里**——
+            工具结果已经被 Runtime 包进 `<tool_result>`，系统提示负责声明其中的内容不可信。
     """
     render = render or ConsoleRenderer()
     params = params or ChatParams()
@@ -132,7 +137,10 @@ def run(
     no_progress = no_progress or NoProgressPolicy()
 
     trace = new_trace()
-    messages: list[ChatMessage] = [{"role": "user", "content": question}]
+    messages: list[ChatMessage] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": question})
     started = time.monotonic()
 
     tokens_used = 0
