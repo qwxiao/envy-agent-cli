@@ -14,6 +14,7 @@ from envy_agent_cli.llm.adapter import ChatModel, OpenAICompatAdapter
 #: provider → 构造器。新增厂商只动这里（Loop 零改动）。
 _REGISTRY: dict[str, Callable[..., ChatModel]] = {
     "deepseek": OpenAICompatAdapter,
+    "glm": OpenAICompatAdapter,
     "openai": OpenAICompatAdapter,
 }
 

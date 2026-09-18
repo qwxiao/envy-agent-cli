@@ -77,6 +77,7 @@ class ChatModel(Protocol):
 #: 厂商默认入口。新增厂商 = 在这里加一行 + 在 factory 注册，Loop 零改动。
 PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
     "deepseek": {"base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat"},
+    "glm": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-5.3-flash"},
     "openai": {"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini"},
 }
 

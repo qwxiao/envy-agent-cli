@@ -161,3 +161,23 @@ def test_provider_defaults_are_applied():
     a = OpenAICompatAdapter("openai", api_key="k")
     assert a.base_url.startswith("https://api.openai.com") and a.model
     assert a.name == "openai"
+
+
+def test_multiple_providers_are_registered_and_share_one_adapter():
+    """多厂商 = 同一份适配器 + 不同入口，Loop 侧完全无感。"""
+    from envy_agent_cli.llm.adapter import PROVIDER_DEFAULTS
+    from envy_agent_cli.llm.factory import available, build
+
+    assert {"deepseek", "glm"} <= set(available())
+    for provider in ("deepseek", "glm"):
+        adapter = build(provider, "k")
+        assert adapter.name == provider
+        assert adapter.base_url == PROVIDER_DEFAULTS[provider]["base_url"]
+        assert adapter.model == PROVIDER_DEFAULTS[provider]["model"]
+
+
+def test_unknown_provider_fails_loud():
+    from envy_agent_cli.llm.factory import build
+
+    with pytest.raises(ValueError, match="未注册的厂商"):
+        build("不存在的厂商", "k")

@@ -2,18 +2,20 @@
 
 单元测试全部离线（伪造 SSE 分片），这个脚本补的是"真网络 + 真协议"那一段：
 请求体是否被服务端接受、真实 HTTP 事件流能否被正确分帧、用量与结束原因是否解析出来。
+同时打印**各事件的到达次数**——这是观察厂商差异最直接的窗口
+（比如某家把思维链放在 content 里，那 ReasoningDelta 就不会出现）。
 
-用法（凭证只走环境变量，不要写进文件）：
+用法：
+    uv run python scripts/smoke_m1.py                # 默认厂商
+    uv run python scripts/smoke_m1.py glm            # 指定厂商
+    uv run python scripts/smoke_m1.py glm "自定义问题"
 
-    set -a; source ../.env; set +a          # 或自行 export API_KEY/BASE_URL/MODEL
-    uv run python scripts/smoke_m1.py
-
-退出码：0 表示链路通；1 表示拿到的是 Error 事件。
+退出码：0 链路通；1 拿到 Error 事件；2 配置缺失。
 """
 
-import os
 import sys
 
+from envy_agent_cli.config import load_settings
 from envy_agent_cli.llm import ChatParams, build
 from envy_agent_cli.llm.events import (
     Error,
@@ -24,32 +26,33 @@ from envy_agent_cli.llm.events import (
     Usage,
 )
 
+DEFAULT_QUESTION = "用一句话解释什么是 SSE（Server-Sent Events）。"
+
 
 def main() -> int:
-    # Windows 控制台默认 GBK，中文输出会乱码
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8")   # Windows 控制台默认 GBK
 
-    api_key = os.environ.get("API_KEY")
-    if not api_key:
-        print("缺少环境变量 API_KEY")
+    argv = sys.argv[1:]
+    provider = argv[0] if argv else None
+    question = argv[1] if len(argv) > 1 else DEFAULT_QUESTION
+
+    try:
+        settings = load_settings(provider=provider)
+    except ValueError as exc:
+        print(f"配置错误：{exc}")
         return 2
 
-    provider = os.environ.get("SMOKE_PROVIDER", "deepseek")
-    adapter = build(
-        provider,
-        api_key,
-        model=os.environ.get("MODEL") or None,
-        base_url=os.environ.get("BASE_URL") or None,
-    )
+    adapter = build(settings.provider, settings.api_key,
+                    model=settings.model, base_url=settings.base_url)
     print(f"provider={adapter.name} model={adapter.model} base_url={adapter.base_url}")
 
-    messages = [{"role": "user", "content": "用一句话解释什么是 SSE（Server-Sent Events）。"}]
     counts: dict[str, int] = {}
     text_chars = reasoning_chars = 0
     failed = False
 
-    for event in adapter.stream_chat(messages, params=ChatParams(temperature=0.2, max_tokens=128)):
+    for event in adapter.stream_chat([{"role": "user", "content": question}],
+                                     params=ChatParams(temperature=0.2, max_tokens=128)):
         name = type(event).__name__
         counts[name] = counts.get(name, 0) + 1
 

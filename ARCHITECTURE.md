@@ -17,7 +17,7 @@ VENDOR STREAM → MODEL ADAPTER → AGENT LOOP → EVENT STORE → SSE GATEWAY �
 
 | 层 | SHOULD DO | SHOULD NOT |
 |---|---|---|
-| 传输（`llm/client.py`） | 发请求、收流、按协议分帧、吐 typed 事件 | ❌ 不打印 ❌ 不攒 tool_calls ❌ 不判断任务是否结束 |
+| 传输（`llm/transport.py`） | 发请求、收流、按协议分帧、吐 typed 事件 | ❌ 不打印 ❌ 不攒 tool_calls ❌ 不判断任务是否结束 |
 | 模型适配（`llm/adapters/`） | 把厂商差异归一化成统一事件流 | ❌ 不拼 SSE ❌ 不渲染 ❌ 不含业务路由 |
 | 编排（`loop/react.py`） | 消费事件、攒工具调用、决定继续/结束、存消息 | ❌ **不执行工具** ❌ 不碰 HTTP/SDK ❌ 不依赖 Request 对象 |
 | 工具（`tools/`） | 查找、校验、鉴权、超时、重试、审计、归一化 | ❌ 不替业务方定义权限规则 ❌ 不假设参数天然正确 |
@@ -144,6 +144,28 @@ Error(message, code, retryable, status_code)        # 连异常都是数据
 
 > **`retryable` 由 Adapter 判定并显式给出，Loop 不推导。** 只有 Adapter 掌握完整上下文
 > （状态码、错误体、尝试次数）；让 Loop 去字符串里找 "429" 是脆弱的。
+
+### 厂商差异（真实 API 实测）
+
+同一份适配器接不同厂商，**差异是实测出来的，不是假设的**：
+
+| 观察项 | DeepSeek | GLM |
+|---|---|---|
+| 思维链字段 | `reasoning_content` | `reasoning_content`（同一字段名，归一化可复用） |
+| 思维链体量 | 约 240 字符 | 约 400 tokens，**且计入 `max_tokens`** |
+| 小 `max_tokens` 的后果 | 仍能输出正文 | **正文为空且不报错** |
+
+GLM-5.3-Flash 同一个问题的实测：
+
+| max_tokens | 思维链片数 | 正文片数 | stop_reason |
+|---|---|---|---|
+| 128 | 127 | **0** | `max_tokens` |
+| 512 | 362 | 35 | `end_turn` |
+| 2048 | 336 | 35 | `end_turn` |
+
+**结论：推理型模型的 `max_tokens` 同时覆盖思维链与正文。** 给小了会得到"空答案且无异常"，
+而 `stop_reason == max_tokens` 是这条链路上**唯一**能识别它的信号——这就是它必须被当成
+失败信号（而不是正常结束）的实证理由。调用方给推理型模型留预算时，要按"思维链 + 正文"算。
 
 ### 重试的四段分工（谁管什么，别搞混）
 
