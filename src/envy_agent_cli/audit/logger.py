@@ -24,7 +24,7 @@ class AuditRecord:
     ts: str
     trace_id: str
     span_id: str | None
-    parent_span: str | None
+    parent_span_id: str | None
     tool: str
     args_digest: str          # 参数摘要，不落全量参数（可能含敏感信息）
     status: str               # ok / error

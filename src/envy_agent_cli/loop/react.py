@@ -9,7 +9,7 @@
 
 **边界（SHOULD NOT）**
 - ❌ **不执行工具**：一律交给 `ToolRuntime.execute_all()`（绕过 Runtime = 校验/权限/审计全部失效）；
-- ❌ 不碰 HTTP / 厂商 SDK（只依赖 `ModelAdapter` Protocol）；
+- ❌ 不碰 HTTP / 厂商 SDK（只依赖 `ChatModel` 契约）；
 - ❌ 不在这一层做 `print` 以外的渲染决策——渲染通过注入的 `render` 回调，将来可换成 UI。
 
 **一句话**：编排层是"翻译官"——把模型的意图翻译成工具动作，把工具结果翻译回模型能懂的对话。
@@ -17,8 +17,8 @@
 
 from typing import Callable
 
+from envy_agent_cli.llm.adapter import ChatMessage, ChatModel
 from envy_agent_cli.llm.events import AnyEvent, MessageEnd, TextDelta, ToolCallDelta, Usage
-from envy_agent_cli.llm.protocol import ChatMessage, ModelAdapter
 from envy_agent_cli.tools.runtime import ToolRuntime
 
 MAX_ROUNDS = 20  # 循环护栏：模型可能死循环调用同一个工具，上限是生产级 Agent 的基本护栏
@@ -27,7 +27,7 @@ MAX_ROUNDS = 20  # 循环护栏：模型可能死循环调用同一个工具，�
 def run(
     question: str,
     *,
-    adapter: ModelAdapter,
+    adapter: ChatModel,
     runtime: ToolRuntime,
     render: Callable[[str], None] = lambda text: print(text, end="", flush=True),
     max_rounds: int = MAX_ROUNDS,

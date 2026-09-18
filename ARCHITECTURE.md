@@ -118,25 +118,60 @@ ToolError(code: ErrorCode, message: str, retryable: bool, tool_call_id: str | No
 
 写成结构化 JSONL 的唯一理由：**给 M6 的评测消费**。改完 Prompt 跑回归集，能从轨迹里看出是哪一步退化了。
 
-## 八、事件协议（模块1，已定）
+## 八、事件协议（模块1，已封版）
+
+**六种事件**：`TextDelta` / `ReasoningDelta` / `ToolCallDelta` / `MessageEnd` / `Usage` / `Error`。
 
 ```python
-TextDelta(text)                              # 正文增量
-ToolCallDelta(index, call_id, name, arguments)  # 工具调用碎片（一次调用被拆成多片）
-MessageEnd(stop_reason)                      # stop_reason: tool_use | end_turn | max_tokens | stop_sequence
+TextDelta(text)                                     # 正文增量（产出）
+ReasoningDelta(text)                                # 思维链增量（过程证据）
+ToolCallDelta(index, is_first, call_id, name, arguments)  # 工具调用碎片
+MessageEnd(stop_reason)                             # tool_use | end_turn | max_tokens | stop_sequence
 Usage(prompt_tokens, completion_tokens, total_tokens)
-Error(message)                               # 连异常都是数据，走同一条通道
+Error(message, code, retryable, status_code)        # 连异常都是数据
 ```
 
-**两条铁律**：
+**四条铁律**：
 1. 流里只做 `arguments += 碎片`，**绝不中途 `json.loads`**（单片不是合法 JSON）——攒的动作在编排层。
-2. 结束判定看 `stop_reason`，**不靠"tool_calls 空不空"猜**。
+2. 结束判定看 `stop_reason`，**不靠"tool_calls 空不空"猜**；`max_tokens` 是**失败信号**，不许"尽量解析截断的 JSON"。
+3. **第一片用 `is_first` 字段标记，不新增事件类型**——避免下游 `isinstance` 分支膨胀。
+4. **错误码与工具层同形状**（`(code, retryable)` 二元组），Loop 只处理一种错误形态。
 
-## 九、待定（未封版，明确挂起）
+### 错误码（`LLMErrorCode`）
 
-| 项 | 状态 | 说明 |
+`invalid_request`（400，本地修）/ `auth_failed`（401/403，终止）/ `rate_limited`（429，退避重试）/
+`server_error`（5xx，退避重试）/ `timeout`（可重试）/ `content_filtered`（终止）/
+`output_invalid`（走输出契约层纠错）/ `unknown`。
+
+> **`retryable` 由 Adapter 判定并显式给出，Loop 不推导。** 只有 Adapter 掌握完整上下文
+> （状态码、错误体、尝试次数）；让 Loop 去字符串里找 "429" 是脆弱的。
+
+### 重试的四段分工（谁管什么，别搞混）
+
+| 层 | 职责 |
+|---|---|
+| Adapter | **纯翻译**：不重试、不路由、不降级 |
+| 工厂 | **路由**：选哪个 Adapter |
+| `RetryPolicy` | **重试**：读 `Error.retryable` 决定再试与退避（独立成类，跨 Adapter 复用） |
+| Loop | **降级**：重试预算耗尽后决定（换模型 / 缩上下文 / 转人工） |
+
+流式重试的硬约束：**只有"还没吐出任何事件就失败"才允许重试**——流吐了一半再重来，
+上层会收到重复正文/工具碎片（等价于"非幂等操作盲目重试"）。
+
+### 输出契约层（决策8 已落地）
+
+`llm/validator.py`：① 定义输出契约 ② 结构校验 ③ 生成纠错提示文本。
+**纠错重试由 Loop 驱动**——validator 自己不发起请求，保持"模块1 不决策"的边界。
+
+判据一句话：**"这个校验需要懂业务吗？"** 需要 → 上层；不需要 → 这里（只做结构/类型，不做业务规则）。
+
+## 九、明确不做（写清"什么条件下才做"）
+
+| 项 | 结论 | 条件 |
 |---|---|---|
-| 模块1「输出契约层」决策8 | **未拍板** | WorkBuddy 侧问过"要不要现在写任务卡"，用户当时转题未答。落地位置预留在 `llm/` 下，暂不建文件 |
-| 摘要压缩器（模块4） | 不在本次范围 | 目录占位，接口待 M2 前定 |
-| MCP 工具接入 | M2 | 外部 MCP 工具与内置工具走**同一个执行入口**（`ToolRuntime.execute`），届时不改 Loop、不改 Runtime 逻辑 |
-| 独立 Gateway / Event Store | 明确不做 | 单进程 CLI 不需要；多端接入时再拆 |
+| 断线续传 | ❌ 不做 | LLM 生成不可重放，协议上有 `Last-Event-ID` 但服务端无重放能力。真要恢复：前端暂存已生成内容，重连后先推存量 |
+| 背压 | ❌ 不做 | 同步生成器 + 单客户端天然跟得上。留注释：未来接多客户端需在 SSE 写入层加队列 + 水位控制 |
+| 独立 Gateway / Event Store | ❌ 不做 | 单进程 CLI 不需要；出现多应用共享 / 多租户 / 统一密钥路由计费时才拆 |
+| `ProviderSwitch` 事件 | ❌ 不加 | 换厂商是工厂内部决策。暴露后上层会写出 `if provider == ...`，等于依赖实现细节 |
+| MCP 工具接入 | M2 | 外部 MCP 工具与内置工具走**同一个执行入口**（`ToolRuntime.execute`），届时不改 Loop、不改 Runtime |
+| 摘要压缩器（模块4） | M2 前定接口 | 目录占位 |

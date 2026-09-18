@@ -9,7 +9,7 @@
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
-| 模块1 LLM 流式客户端 | 🟡 接口已封版，实现待填 | 事件协议已定；传输层（SSE 分帧）实现待移植 |
+| 模块1 LLM 流式客户端 | 🟢 **实现完成** | 事件协议 / 传输层（SSE 分帧）/ Adapter 归一化 / 工厂 / RetryPolicy / 输出契约层，全部有测试 |
 | 模块2 ReAct 主循环 | 🟡 接口已封版，实现待填 | 编排职责边界已定：**Loop 只编排，不执行** |
 | 模块3 工具层（Tool Runtime） | 🟡 接口已封版，实现待填 | 七字段 / 三契约 / 七职责 已定 |
 | 模块4 上下文压缩器 | ⚪ 目录占位 | 接口待定 |
@@ -20,12 +20,14 @@
 
 ```
 src/envy_agent_cli/
-├── llm/                模块1 · 传输与协议
-│   ├── events.py         事件类型（typed 事件流）
-│   ├── protocol.py       ModelAdapter Protocol —— Loop 只依赖它，不依赖厂商 SDK
-│   ├── adapters/         各厂商适配（多厂商 = 加一个实现 + 注册，Loop 零改动）
-│   ├── factory.py        Adapter 工厂（路由 / fallback 只发生在这里）
-│   └── client.py         SSE 分帧 + 事件化（传输层）
+├── llm/                模块1 · 传输 + 协议 + 适配
+│   ├── transport.py      SSE 分帧（字节 → 事件块，只认协议不认模型）
+│   ├── events.py         事件协议（六种，Error 带 code/retryable）
+│   ├── params.py         ChatParams（显式参数对象，可序列化可版本化）
+│   ├── adapter.py        ChatModel 契约 + OpenAI 兼容实现（厂商差异归一化）
+│   ├── factory.py        工厂（路由 / fallback 的唯一发生地）
+│   ├── retry.py          RetryPolicy（跨 Adapter 复用，独立成类）
+│   └── validator.py      输出契约层（结构校验 + 纠错提示）
 ├── loop/               模块2 · 编排
 │   └── react.py          ReAct 主循环（消费事件、攒调用、决定继续或结束）
 ├── tools/              模块3 · 受控执行

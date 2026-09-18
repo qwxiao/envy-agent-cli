@@ -17,9 +17,9 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 
-# 依赖留空：骨架阶段不引入任何运行时依赖。
-# 传输层实现时再加 httpx；参数校验升级 Pydantic 时再加 pydantic。
-dependencies = []
+# 只依赖 httpx：同步流式客户端手写，不用厂商 SDK（核心链路要吃透）。
+# 参数/输出校验目前零依赖（轻量结构校验），升 Pydantic 时再加。
+dependencies = ["httpx>=0.27"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]

@@ -1,8 +1,8 @@
-"""骨架自检：保证"封版的接口"没被悄悄改掉，以及"边界"没被越过去。
+"""契约守卫与边界守卫。
 
-骨架阶段的测试不做行为验证（实现还没填），只做两件事：
-1. **契约守卫**：七字段、三契约、事件类型、错误码，数量与名字对得上；
-2. **边界守卫**：静态检查编排层没有绕过 Runtime 直接调工具——这是架构红线。
+骨架/实现阶段都保留这组测试，它盯的是**两件容易悄悄坏掉的事**：
+1. **封版的接口**不能被人随手改掉（七字段、三契约、六种事件、错误码形状）；
+2. **架构边界**不能被越过（分层方向、Loop 不执行工具、trace 是叶子）。
 """
 
 import ast
@@ -24,26 +24,52 @@ def test_tool_spec_has_seven_contract_fields():
                 "permission", "risk"}
     assert contract <= set(ToolSpec.__dataclass_fields__), "ToolSpec 七字段不完整"
 
-    # handler 是**实现层**，绝不能混进声明层
+    # handler 是**实现层**，绝不能混进声明层（模型永远看不到它）
     assert "handler" not in ToolSpec.__dataclass_fields__, "handler 不属于 schema 层"
 
 
 def test_registered_tool_keeps_implementation_and_exec_hints_separate():
-    """执行参数（读写/并发/超时）与声明层分开存放。"""
     from envy_agent_cli.tools.spec import RegisteredTool
 
     fields = set(RegisteredTool.__dataclass_fields__)
     assert {"spec", "handler", "read_only", "concurrency_safe", "timeout", "max_retries"} <= fields
 
 
-def test_error_codes_and_retry_policy():
-    """只有瞬时故障可重试——这是"失败恢复"的依据，不能靠异常类型猜。"""
+def test_risk_levels_replaced_the_single_bool():
+    """`needs_confirmation` 单 bool 已被三级 risk 取代——粗粒度会逼出硬编码。"""
+    from envy_agent_cli.tools.spec import Risk
+
+    assert {r.value for r in Risk} == {"low", "medium", "high"}
+
+
+def test_error_shapes_are_unified_across_llm_and_tools():
+    """模型错误与工具错误必须是同一种形状：`(code, retryable)`。
+
+    形状不统一，Loop 就得为两种错误写两套分支——那正是我们要避免的耦合。
+    """
+    from envy_agent_cli.llm.events import Error as LLMError
+    from envy_agent_cli.llm.events import LLMErrorCode
+    from envy_agent_cli.tools.result import ErrorCode, ToolError
+
+    llm_fields = set(LLMError.__dataclass_fields__)
+    assert {"code", "retryable", "message"} <= llm_fields
+
+    tool_fields = set(ToolError.__dataclass_fields__)
+    assert {"code", "retryable", "message"} <= tool_fields
+
+    assert LLMErrorCode.AUTH_FAILED.value == "auth_failed"
+    assert ErrorCode.PERMISSION_DENIED.value == "PERMISSION_DENIED"
+
+
+def test_only_transient_errors_are_retryable():
+    from envy_agent_cli.llm.events import RETRYABLE_LLM_CODES, LLMErrorCode
     from envy_agent_cli.tools.result import RETRYABLE_CODES, ErrorCode
 
-    assert ErrorCode.TIMEOUT in RETRYABLE_CODES
-    assert ErrorCode.UPSTREAM_ERROR in RETRYABLE_CODES
-    for code in (ErrorCode.INVALID_ARGUMENT, ErrorCode.PERMISSION_DENIED, ErrorCode.REJECTED_BY_USER):
-        assert code not in RETRYABLE_CODES, f"{code} 不该重试"
+    assert RETRYABLE_LLM_CODES == {LLMErrorCode.RATE_LIMITED, LLMErrorCode.SERVER_ERROR,
+                                   LLMErrorCode.TIMEOUT}
+    assert LLMErrorCode.INVALID_REQUEST not in RETRYABLE_LLM_CODES
+    assert LLMErrorCode.AUTH_FAILED not in RETRYABLE_LLM_CODES
+    assert ErrorCode.INVALID_ARGUMENT not in RETRYABLE_CODES
 
 
 def test_tool_error_derives_retryable_from_code():
@@ -53,37 +79,56 @@ def test_tool_error_derives_retryable_from_code():
     assert ToolError.from_code(ErrorCode.INVALID_ARGUMENT, "参数错").retryable is False
 
 
-def test_event_protocol_is_complete():
-    """模块1 的事件类型：正文增量 / 工具碎片 / 消息结束 / 用量 / 错误，一个都不能少。"""
+def test_event_protocol_is_six_events():
+    """事件协议：正文 / 思维链 / 工具碎片 / 消息结束 / 用量 / 错误，一个都不能少。"""
     from envy_agent_cli.llm import events
 
-    for name in ("TextDelta", "ToolCallDelta", "MessageEnd", "Usage", "Error"):
+    for name in ("TextDelta", "ReasoningDelta", "ToolCallDelta", "MessageEnd", "Usage", "Error"):
         assert hasattr(events, name), f"事件类型缺 {name}"
 
-    # 工具调用的参数是**碎片**，必须能增量追加而不是一次性完整 JSON
-    delta = events.ToolCallDelta(index=0, call_id="call_1", name="read_file", arguments='{"pa')
+    assert set(events.StopReason.__args__) == {"tool_use", "end_turn", "max_tokens",
+                                               "stop_sequence"}
+
+
+def test_tool_call_delta_carries_is_first_instead_of_new_event_type():
+    """第一片用字段标记，不新增事件类型——避免下游 isinstance 分支膨胀。"""
+    from envy_agent_cli.llm.events import ToolCallDelta
+
+    delta = ToolCallDelta(index=0, is_first=True, call_id="c1", name="read_file", arguments='{"pa')
     delta.arguments += 'th": "a.txt"}'
+    assert delta.is_first is True
     assert delta.arguments == '{"path": "a.txt"}'
 
 
-def test_model_adapter_is_a_runtime_checkable_protocol():
-    """Loop 只依赖 Protocol，不依赖任何厂商 SDK——这是"换模型不改 Loop"的前提。"""
-    from envy_agent_cli.llm.protocol import ModelAdapter
+def test_chat_params_is_frozen_with_documented_default():
+    from dataclasses import FrozenInstanceError
+
+    from envy_agent_cli.llm.params import ChatParams
+
+    params = ChatParams()
+    assert params.temperature == 0.2
+    assert params.to_body_fields()["temperature"] == 0.2
+    with pytest.raises(FrozenInstanceError):
+        params.temperature = 0.9  # type: ignore[misc]
+
+
+def test_chat_model_is_a_runtime_checkable_protocol():
+    """Loop 只依赖 Protocol，不依赖任何厂商 SDK——"换模型不改 Loop"的前提。"""
+    from envy_agent_cli.llm.adapter import ChatModel
 
     class FakeAdapter:
         name = "fake"
 
-        def stream_chat(self, messages, tools=None, **params):
+        def stream_chat(self, messages, tools=None, params=None, trace=None):
             return iter(())
 
-    assert isinstance(FakeAdapter(), ModelAdapter)
+    assert isinstance(FakeAdapter(), ChatModel)
 
 
 # ---------------------------------------------------------------- 边界守卫
 
 
 def _called_names(node: ast.AST) -> set[str]:
-    """收集文件里被调用的函数名 / 属性名，用于静态边界检查。"""
     names: set[str] = set()
     for sub in ast.walk(node):
         if isinstance(sub, ast.Call):
@@ -110,8 +155,14 @@ def test_loop_never_calls_tool_handlers_directly():
     assert "ToolRuntime" in source, "编排层必须通过 ToolRuntime 执行工具"
 
 
+def test_adapter_does_not_retry_or_render():
+    """Adapter 是契约不是适配层：重试归 RetryPolicy、路由归工厂、降级归 Loop。"""
+    source = (SRC / "llm" / "adapter.py").read_text(encoding="utf8")
+    assert "import envy_agent_cli.llm.retry" not in source
+    assert "print(" not in source
+
+
 def test_runtime_exposes_single_execution_entry():
-    """Runtime 对外只应有 execute / execute_all 两个入口。"""
     from envy_agent_cli.tools.runtime import ToolRuntime
 
     public = {n for n in dir(ToolRuntime) if not n.startswith("_")}
@@ -125,8 +176,8 @@ def test_no_reverse_layer_dependency():
     （骨架第一次跑测试就是这么炸的），同时也是架构红线的静态表达。
     """
     rules = {
-        "llm": ("loop", "tools", "context"),      # 传输层只知道协议
-        "tools": ("loop",),                        # 执行层不该知道编排层存在
+        "llm": ("loop", "tools", "context", "audit"),
+        "tools": ("loop",),
         "context": ("loop",),
     }
     for layer, forbidden in rules.items():
@@ -138,15 +189,24 @@ def test_no_reverse_layer_dependency():
 
 
 def test_trace_context_is_a_leaf_module():
-    """trace 是跨层共享的叶子模块，自己不能依赖任何内部模块（否则又会绕回循环 import）。"""
+    """trace 是跨层共享的叶子：只依赖标准库，且是纯数据。"""
     source = (SRC / "trace.py").read_text(encoding="utf8")
     for upper in ("llm", "loop", "tools", "context", "audit"):
         assert f"envy_agent_cli.{upper}" not in source, f"trace 依赖了 {upper}"
+
+    from dataclasses import FrozenInstanceError
+
+    from envy_agent_cli.trace import new_trace, round_span, tool_span
+
+    trace = round_span(new_trace(), 2)
+    assert trace.span_id.endswith(":r2")
+    assert tool_span(trace).parent_span_id == trace.span_id
+    with pytest.raises(FrozenInstanceError):
+        trace.trace_id = "x"  # type: ignore[misc]
 
 
 @pytest.mark.parametrize("module", ["envy_agent_cli", "envy_agent_cli.llm", "envy_agent_cli.loop",
                                     "envy_agent_cli.tools", "envy_agent_cli.audit",
                                     "envy_agent_cli.context", "envy_agent_cli.trace"])
 def test_packages_importable(module):
-    """骨架最起码要能被导入。"""
     __import__(module)
