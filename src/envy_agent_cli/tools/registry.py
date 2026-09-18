@@ -35,6 +35,17 @@ def all_tools() -> list[RegisteredTool]:
 def to_model_schemas() -> list[dict]:
     """投影成模型契约（OpenAI 兼容的 tools 参数）。
 
-    这是"模型能看到什么"的**唯一定义处**——三样，多一样都不给。
+    这是"模型能看到什么"的**唯一定义处**——`name` + `description` + `input_schema` 三样。
+    权限、风险等级、重试策略、Python 实现，模型一律看不到。
     """
-    raise NotImplementedError("待移植：ToolSpec.input_model → JSON Schema 投影")
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.spec.name,
+                "description": tool.spec.description,
+                "parameters": tool.spec.input_model,
+            },
+        }
+        for tool in _REGISTRY.values()
+    ]
