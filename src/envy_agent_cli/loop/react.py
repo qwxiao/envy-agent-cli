@@ -216,7 +216,9 @@ def run(
                               STOP_NO_PROGRESS, True,
                               f"重复 {repeat_full} 轮；指纹={_short_fingerprint(signature)}；"
                               f"起始轮次=r{round_no - repeat_full + 1}")
-            if repeat_call >= no_progress.warn_after:
+            # 只在**跨过阈值那一轮**提示一次（`==` 而不是 `>=`）：
+            # 一轮一条提示会把对话塞满同样的内容，模型反而更容易忽略
+            if repeat_call == no_progress.warn_after:
                 render.notice("检测到重复调用，已提示模型换策略")
                 messages.append({"role": "user", "content": NO_PROGRESS_HINT})
 

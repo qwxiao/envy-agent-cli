@@ -281,7 +281,9 @@ def test_repeated_calls_with_changing_results_only_warns():
     result, _, _ = run_once(adapter, runtime=ChangingRuntime(), budget=Budget(max_rounds=4))
 
     assert result.stop_reason == STOP_MAX_ROUNDS, "结果在变就不该判打转"
-    assert any(m.get("content") == NO_PROGRESS_HINT for m in result.messages)
+    # 每段重复只提示一次：一轮一条提示会把对话塞满同样的内容
+    hints = [m for m in result.messages if m.get("content") == NO_PROGRESS_HINT]
+    assert len(hints) == 1, f"提示应只注入一次，实际 {len(hints)} 次"
 
 
 def test_different_calls_never_trigger_no_progress():
