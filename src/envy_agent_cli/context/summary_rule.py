@@ -3,8 +3,8 @@
 不调模型：零成本、确定、可离线断言。代价是**信息有损、没有语义提炼**——
 它保的是"目标 / 决策 / 文件 / 未完成工作"这些骨架，细节和语义联系会丢。
 
-摘要开头显式写明"这是压缩稿、可能不完整"：
-**宁可让丢失"可感知"，也别让丢失"不可感知"**——后者才是真坑。
+**只产出条目，不管包装。** 标签与开场白由 `build_summary_message` 负责——
+如果开场白写在这里，它就会跟着每份被带过来的旧摘要重复出现 N 次。
 """
 
 import json
@@ -13,10 +13,6 @@ import re
 from envy_agent_cli.context.compactor import ENGINE_RULE
 
 _WHITESPACE = re.compile(r"\s+")
-
-#: 摘要正文的开场白。**标签由 `build_summary_message` 负责包**——这里再带一次就会出现双层标签，
-#: 让 `grep <history_summary>` 这个审计锚点变成两个，锚点也就失去意义了。
-HEADER = "更早的对话已被压缩成下面这份要点清单。它是有损的：保留目标、决定、涉及的文件与还没做完的事，但细节不完整——需要精确内容时请重新读取，不要以清单为准。"
 
 
 class RuleSummaryEngine:
@@ -36,11 +32,11 @@ class RuleSummaryEngine:
 
     def summarize(self, turns: list[dict]) -> str:
         if not turns:
-            return HEADER
+            return ""
 
         quota = max(self.per_message_min,
                     min(self.per_message_max, self.max_chars // max(1, len(turns))))
-        lines = [HEADER]
+        lines: list[str] = []
         for message in turns:
             text = self._render(message)
             if not text:
@@ -66,4 +62,4 @@ class RuleSummaryEngine:
         return text
 
 
-__all__ = ["RuleSummaryEngine", "HEADER"]
+__all__ = ["RuleSummaryEngine"]

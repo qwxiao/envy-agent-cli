@@ -411,6 +411,24 @@ def test_summary_message_is_plain_text_without_tool_calls():
     assert "tool_calls" not in summaries[0]
 
 
+def test_summary_sits_before_every_other_user_message():
+    """摘要本身是 `user`，位置必须排在**其它所有 user 之前**。
+
+    插在对话中间会被模型当成"用户中途插话"，多轮语义就断了。
+    实现上靠"提 system + 摘要 + 保留区"的顺序天然满足，这条断言把它固化成不变式——
+    将来有人调整拼接顺序，会在这里被挡住。
+    """
+    messages = long_task(30) + [{"role": "user", "content": "顺便再确认一下结论"}]
+    m = manager(budget=tight_budget(messages))
+    result = m.prepare(messages)
+    assert result.compressed is True
+    index = next(i for i, x in enumerate(result.messages) if SUMMARY_TAG in str(x.get("content")))
+    others = [i for i, x in enumerate(result.messages)
+              if x.get("role") == "user" and i != index]
+    assert others, "这条用例要有一个被保留的 user，否则断言是空的"
+    assert all(i > index for i in others)
+
+
 def test_summary_role_is_user_because_the_protocol_demands_it():
     """摘要必须是 `user`：system 之后的第一条消息不能是 `assistant`。
 
@@ -559,9 +577,65 @@ def test_rule_engine_is_injectable_and_deterministic():
     assert "assistant" in first
 
 
-def test_rule_engine_marks_the_summary_as_lossy():
-    text = RuleSummaryEngine().summarize(long_task(3))
-    assert "有损" in text
+def test_summary_marks_itself_as_lossy():
+    """开场白由消息构造处加，不由引擎加——否则它会被层叠的旧摘要带出 N 份。"""
+    message = build_summary_message(RuleSummaryEngine().summarize(long_task(3)))
+    assert "有损" in message["content"]
+    assert "不要以清单为准" in message["content"]
+
+
+def test_preamble_appears_exactly_once_however_many_times_it_is_stacked():
+    """连续压很多次之后，开场白仍只出现一次。"""
+    fat = dict(filler="内容" * 20)
+    messages = long_task(4, **fat)
+    for _ in range(3):
+        prepared = manager(budget=tight_budget(messages, min_recent_messages=2),
+                           engine=RuleSummaryEngine()).prepare(messages)
+        assert prepared.compressed is True
+        messages = list(prepared.messages) + long_task(4, **fat)
+    summary = next(x for x in messages if SUMMARY_TAG in str(x.get("content")))
+    assert summary["content"].count("更早的对话已被压缩成") == 1
+
+
+def test_existing_summary_is_carried_forward_not_re_summarized():
+    """已有摘要不参与二次摘要，而是**原样拼到新摘要前面**。
+
+    否则它的开场白会被逐层嵌进新摘要（摘要在摘要里在摘要里…），越压越大——
+    真机上实测出现过"压完比压前还长"。分层摘要明确不做。
+    """
+    fat = dict(filler="内容" * 20)     # 每条消息都够大，规则摘要才赚得回票价
+    messages = long_task(4, **fat)
+    first = manager(budget=tight_budget(messages, min_recent_messages=2),
+                    engine=RuleSummaryEngine()).prepare(messages)
+    assert first.compressed is True
+    first_summary = next(x for x in first.messages if SUMMARY_TAG in str(x.get("content")))
+
+    # 在第一份摘要之上继续长，按新规模重算预算，保证第二次也触发
+    grown = list(first.messages) + long_task(4, **fat)
+    second = manager(budget=tight_budget(grown, min_recent_messages=2),
+                     engine=RuleSummaryEngine()).prepare(grown)
+    assert second.compressed is True
+    second_summary = next(x for x in second.messages if SUMMARY_TAG in str(x.get("content")))
+
+    # 修复前：旧摘要会被当成普通轮次，再摘要成 `- user: <history_summary> ...` 一行，
+    # 开场白逐层嵌套、越压越大。修复后它是**原样拼接**，不是被再摘要成一行。
+    assert f"- user: <{SUMMARY_TAG}>" not in second_summary["content"], "旧摘要被二次摘要了"
+    assert second_summary["content"].count(f"<{SUMMARY_TAG}>") == 1
+    # 带过来的内容完整保留（这条 user 只在第一份摘要里出现过，不该丢）
+    assert "- user: 帮我看下这个项目" in second_summary["content"]
+
+
+def test_compression_that_would_grow_the_context_is_rolled_back():
+    """压完反而更大 → 原样返回。压缩的唯一目的是变小，它不能成为新的风险源。"""
+    messages = [{"role": "system", "content": "S"}, {"role": "user", "content": "问题"},
+                {"role": "assistant", "content": "回答"}] + long_task(20)
+    m = ContextWindowManager(budget=tight_budget(messages, min_recent_messages=2),
+                             summary_engine=FakeEngine("很长的摘要" * 3000))
+    result = m.prepare(messages)
+    assert result.compressed is False
+    assert result.messages == messages
+    assert result.estimated_tokens_after == result.estimated_tokens_before
+    assert result.triggered_by != TRIGGER_NONE        # 触发过，只是无收益
 
 
 def test_summary_tag_appears_exactly_once():
@@ -576,7 +650,9 @@ def test_rule_engine_output_is_capped():
 
 
 def test_rule_engine_handles_empty_turns():
-    assert RuleSummaryEngine().summarize([])
+    assert RuleSummaryEngine().summarize([]) == ""
+    # 没有条目时，包装出来的仍是一条合法摘要（只有开场白）
+    assert SUMMARY_TAG in build_summary_message("")["content"]
 
 
 def test_summary_message_shape():
@@ -643,34 +719,43 @@ class ScriptedAdapter:
 
 
 class StubRuntime:
+    """工具结果给足体量——不然"压缩"这个动作本身赚不回它自己的开销。"""
+
     def __init__(self) -> None:
         self.calls: list[list] = []
 
     def execute_all(self, calls, trace):
         self.calls.append(calls)
-        return [ToolResult(content="ok", tool_call_id=call["id"]) for call in calls]
+        return [ToolResult(content="读取到的文件内容。" * 80, tool_call_id=call["id"]) for call in calls]
 
 
 def tiny_budget(**over) -> ContextBudget:
-    """小窗口 + 只保留 2 条：让压缩在第 2 轮就能触发，集成测试不用跑满 20 轮。"""
-    base = dict(context_window=180, max_output_tokens=0, reserve_tokens=0,
+    """小窗口 + 只保留少数几条，让压缩在几轮内就触发，集成测试不用跑满 20 轮。"""
+    base = dict(context_window=4000, max_output_tokens=0, reserve_tokens=0,
                 trigger_ratio=0.80, target_ratio=0.50,
-                min_recent_messages=2, max_history_messages=100)
+                min_recent_messages=4, max_history_messages=100)
     base.update(over)
     return ContextBudget(**base)
 
 
+def many_tool_rounds(count: int) -> list[list]:
+    """连续几轮工具调用，最后收尾——把历史堆到能触发压缩的规模。"""
+    return [tool_round(index) for index in range(count)] + [[TextDelta("完成"), MessageEnd("end_turn")]]
+
+
 def tool_round(index: int) -> list:
+    """每轮用不同的路径——参数一样会被打转检测提前终止，测试就跑不到压缩那一步。"""
+    arguments = f'{{"path": "file_{index}.py"}}'
     return [
         ToolCallDelta(index=0, is_first=True, call_id=f"c{index}", name="read_file",
-                      arguments='{"path"'),
-        ToolCallDelta(index=0, is_first=False, arguments=': "a.txt"}'),
+                      arguments=arguments[:8]),
+        ToolCallDelta(index=0, is_first=False, arguments=arguments[8:]),
         MessageEnd("tool_use"),
     ]
 
 
 def run_with_policy(policy, tmp_path, rounds=None):
-    adapter = ScriptedAdapter(rounds or [tool_round(0), [TextDelta("完成"), MessageEnd("end_turn")]])
+    adapter = ScriptedAdapter(rounds or many_tool_rounds(6))
     runtime = StubRuntime()
     logger = AuditLogger(tmp_path / "audit.jsonl")
     result = run("请阅读这个项目的若干文件" * 12, adapter=adapter, runtime=runtime,
@@ -686,7 +771,7 @@ def test_compaction_is_recorded_in_both_the_result_and_the_audit(tmp_path):
     result, adapter, logger = run_with_policy(policy, tmp_path)
 
     assert result.stop_reason == "end_turn"
-    assert len(result.context_events) == 1
+    assert len(result.context_events) >= 1
 
     records = [r for r in logger.trace_lines(result.trace_id) if r.kind == "compact"]
     assert len(records) == len(result.context_events)
@@ -702,8 +787,8 @@ def test_compaction_happens_before_the_request_not_after(tmp_path):
     """压缩只在发请求之前发生：模型看到的第二轮 messages 里已经带着摘要。"""
     policy = ContextWindowManager(budget=tiny_budget(), summary_engine=RuleSummaryEngine())
     _, adapter, _ = run_with_policy(policy, tmp_path)
-    second_round = adapter.seen[1]
-    assert any(SUMMARY_TAG in str(message.get("content")) for message in second_round)
+    assert any(SUMMARY_TAG in str(message.get("content")) for message in adapter.seen[-1]), \
+        "最后一次请求里应当带着摘要——压缩发生在发请求之前，不是之后"
 
 
 def test_system_message_is_still_there_after_a_real_run(tmp_path):
@@ -727,6 +812,6 @@ def test_summary_failure_is_audited_separately(tmp_path):
                                   summary_engine=FakeEngine(error=RuntimeError("上游 429")))
     result, _, logger = run_with_policy(policy, tmp_path)
     failures = [r for r in logger.trace_lines(result.trace_id) if r.kind == "compress_failed"]
-    assert len(failures) == 1
+    assert len(failures) >= 1
     assert "429" in failures[0].detail["error"]
     assert result.context_events == []

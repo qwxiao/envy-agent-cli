@@ -167,12 +167,32 @@ def _is_safe_split(messages: list[dict], split: int) -> bool:
     return not orphan_tools and not dangling_calls
 
 
-def _summarizable(messages: list[dict]) -> list[dict]:
-    """可进摘要的消息：**所有 `system` 消息都不算**。
+def _summary_body(message: dict) -> str | None:
+    """这条消息是摘要吗？是则返回它的正文（**标签和开场白都剥掉**），否则返回 `None`。
 
-    保护 system 靠**角色判断**，不靠位置假设——位置假设是脆的，把 system 放中间的那天就是它失效的那天。
+    剥开场白是为了层叠：旧摘要会被原样带进新摘要，如果连开场白一起带，
+    压了 N 次之后摘要开头就会连着 N 句"更早的对话已被压缩成…"。
     """
-    return [message for message in messages if message.get("role") != SYSTEM_ROLE]
+    content = _text_of(message)
+    if f"<{SUMMARY_TAG}>" not in content:
+        return None
+    body = content.replace(f"<{SUMMARY_TAG}>", "").replace(f"</{SUMMARY_TAG}>", "")
+    body = body.replace(SUMMARY_PREAMBLE, "")
+    return body.strip()
+
+
+def _summarizable(messages: list[dict]) -> list[dict]:
+    """可进摘要的消息：**所有 `system` 消息不算，已有的摘要也不算**。
+
+    - 保护 system 靠**角色判断**，不靠位置假设——位置假设是脆的，把 system 放中间的那天就是它失效的那天；
+    - **已有摘要不参与二次摘要**。它是"关于历史的注记"，不是历史本身；
+      再摘一次只会把它的开场白逐层嵌进新摘要，越压越大（实测出现过"压完比压前还长"）。
+      **分层摘要明确不做**——它是被拼接到新摘要前面的，不是被再压一遍的。
+    """
+    return [
+        message for message in messages
+        if message.get("role") != SYSTEM_ROLE and _summary_body(message) is None
+    ]
 
 
 # ---------------------------------------------------------------- 数据契约
@@ -263,6 +283,14 @@ def to_context_event(result: PrepareResult, span_id: str) -> ContextEvent:
     )
 
 
+#: 摘要的开场白。**放在消息构造处，不放在引擎里**——引擎的输出会被层叠拼接
+#: （旧摘要原样带过来 + 新摘要），开场白写在引擎里就会出现 N 次。
+SUMMARY_PREAMBLE = (
+    "更早的对话已被压缩成下面这份要点清单。它是有损的：保留目标、决定、涉及的文件与还没做完的事，"
+    "但细节不完整——需要精确内容时请重新读取，不要以清单为准。"
+)
+
+
 def build_summary_message(text: str) -> dict:
     """摘要消息：`user` + 纯文本，**绝不能带 `tool_calls`**。
 
@@ -274,7 +302,8 @@ def build_summary_message(text: str) -> dict:
 
     `<history_summary>` 标签承担两件事：让模型知道这段是有损的压缩稿，以及给审计当锚点。
     """
-    return {"role": USER_ROLE, "content": f"<{SUMMARY_TAG}>\n{text}\n</{SUMMARY_TAG}>"}
+    body = f"{SUMMARY_PREAMBLE}\n{text}" if text else SUMMARY_PREAMBLE
+    return {"role": USER_ROLE, "content": f"<{SUMMARY_TAG}>\n{body}\n</{SUMMARY_TAG}>"}
 
 
 # ---------------------------------------------------------------- 契约
@@ -337,6 +366,8 @@ class ContextWindowManager:
         # system 提出来原样留在最前，摘要插在最后一条 system 之后、保留区之前
         leading = [message for message in older if message.get("role") == SYSTEM_ROLE]
         turns = _summarizable(older)
+        # 更早的摘要**原样带过来**，不重新摘要——见 `_summarizable` 的说明
+        carried = [body for body in (_summary_body(m) for m in older) if body]
 
         try:
             summary = self.summary_engine.summarize(turns)
@@ -345,6 +376,8 @@ class ContextWindowManager:
                                  estimated_tokens_after=before,
                                  triggered_by=triggered_by, summary_engine=self.summary_engine.name,
                                  failure=f"{type(exc).__name__}: {exc}")
+        if carried:
+            summary = "\n".join([*carried, summary])
 
         compacted = leading + [build_summary_message(summary)] + kept
         compacted, truncated = self._truncate_tool_payloads(compacted)
@@ -356,6 +389,13 @@ class ContextWindowManager:
             compacted = self._shrink_summary(compacted)
             after = self._estimator(compacted, tool_definitions)
             shrank_twice = True
+
+        # 压完反而更大 → 整件事白做，还平白多花了一次摘要。原样返回，走"没触发"那条出口。
+        # 压缩的唯一目的是变小；**一个保证性手段不能成为新的风险源**。
+        if after >= before:
+            return PrepareResult(messages=list(messages), estimated_tokens_before=before,
+                                 estimated_tokens_after=before, triggered_by=triggered_by,
+                                 summary_engine=self.summary_engine.name)
 
         return PrepareResult(
             messages=compacted,
