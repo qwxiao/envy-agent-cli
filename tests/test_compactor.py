@@ -34,7 +34,8 @@ from envy_agent_cli.context.compactor import (
     estimate_tokens,
     to_context_event,
 )
-from envy_agent_cli.context.summary_rule import RuleSummaryEngine
+from envy_agent_cli.context.summary_rule import DISCARDED, TOOL_RESULT_TAG, RuleSummaryEngine
+from envy_agent_cli.tools.runtime import wrap_result
 from envy_agent_cli.audit.logger import AuditLogger
 from envy_agent_cli.llm.events import MessageEnd, TextDelta, ToolCallDelta
 from envy_agent_cli.llm.params import ChatParams
@@ -636,6 +637,46 @@ def test_compression_that_would_grow_the_context_is_rolled_back():
     assert result.messages == messages
     assert result.estimated_tokens_after == result.estimated_tokens_before
     assert result.triggered_by != TRIGGER_NONE        # 触发过，只是无收益
+
+
+def test_long_tool_result_becomes_an_index_not_a_truncated_body():
+    """验收 3 的修复：过长的工具结果**不给半截原文**，只给索引 + 显式标记。
+
+    给半截原文比不给更糟——模型看到 `from ... import ...` 会以为自己持有源码，**从而不去重读**，
+    摘要前言声明的"需要精确内容时请重新读取"就从索引退化成了误导。
+    """
+    engine = RuleSummaryEngine(max_chars=3000)
+    message = {"role": "tool", "tool_call_id": "c1",
+               "content": wrap_result('"""模块头。"""\nfrom a import b\n' + "正文。" * 2000,
+                                      "read_file", "c1")}
+    line = engine.summarize([message])
+    assert "read_file" in line                      # 哪个工具
+    assert "字符" in line and "未保留" in line       # 多大、正文没留
+    assert DISCARDED in line                        # 显式可感知
+    assert "from a import b" not in line, "不许把半截原文塞进摘要"
+    assert len(line) < 200, "工具结果应当被压成一行索引，而不是一段正文"
+
+
+def test_short_tool_result_is_kept_verbatim():
+    """短结果原样留着——它本来就是内容，不存在"半截"问题。"""
+    engine = RuleSummaryEngine(max_chars=6000)
+    message = {"role": "tool", "tool_call_id": "c1",
+               "content": wrap_result("a.txt\nb.txt\nc.txt", "list_dir", "c1")}
+    line = engine.summarize([message])
+    assert "a.txt" in line and "b.txt" in line
+    assert DISCARDED not in line
+
+
+def test_tool_result_tag_matches_the_runtime_wrapper():
+    """上下文层故意不复用工具层的常量，两边的标签是否一致由这条测试守着。"""
+    from envy_agent_cli.tools.runtime import TOOL_RESULT_TAG as RUNTIME_TAG
+
+    assert TOOL_RESULT_TAG == RUNTIME_TAG
+    # 并且真的能从 Runtime 产出的包装里取出工具名
+    produced = wrap_result("内容", "grep_files", "c9")
+    line = RuleSummaryEngine(max_chars=100).summarize(
+        [{"role": "tool", "tool_call_id": "c9", "content": produced}])
+    assert "grep_files" in line
 
 
 def test_summary_tag_appears_exactly_once():
