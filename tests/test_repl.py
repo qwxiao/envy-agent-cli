@@ -142,17 +142,45 @@ def test_command_set_covers_the_basics(ctx):
 # ---------------------------------------------------------------- 渲染
 
 
-def test_renderer_buffers_text_and_flushes():
+def test_renderer_streams_immediately():
+    """流式直出：不必等 flush 就能看到内容。"""
     console = plain_console()
     renderer = RichRenderer(console)
 
-    renderer.text("**加粗")
-    renderer.text("**完成")
+    renderer.text("第一片")
+    assert "第一片" in console.file.getvalue()
+
+    renderer.text("第二片")
+    renderer.flush()
+    assert renderer._text == ""                # flush 后清空，下一轮从零开始
+
+
+def test_long_stream_is_not_repeated():
+    """⚠️ 回归测试。
+
+    曾用 `Live(transient=True)` 做流式预览，而它的机制是"光标回起点 → 清除 → 重画"。
+    内容一旦超过一屏高度，光标就没法再往上移，重画退化成向下追加——
+    同一句话在屏幕上出现了几百遍。现在直出，写几遍就是几遍。
+    """
+    console = plain_console()
+    renderer = RichRenderer(console)
+    line = "一句会被折成多行显示的比较长的话。"
+    for _ in range(200):
+        renderer.text(line + "\n")
     renderer.flush()
 
-    output = console.file.getvalue()
-    assert "加粗" in output and "完成" in output
-    assert renderer._text == ""                # flush 后清空，下一轮从零开始
+    assert console.file.getvalue().count(line) == 200      # 不多不少
+
+
+def test_reasoning_then_text_breaks_the_line():
+    """思维链切回正文要断开，否则两段会连成一句。"""
+    console = plain_console()
+    renderer = RichRenderer(console, show_reasoning=True)
+    renderer.reasoning("我在想")
+    renderer.text("答案")
+    renderer.flush()
+
+    assert "我在想\n" in console.file.getvalue()
 
 
 def test_renderer_flush_is_idempotent_on_empty():
