@@ -110,6 +110,32 @@ def test_command_matching_is_case_insensitive(ctx):
     assert dispatch("/HELP", ctx).message
 
 
+def test_history_reports_message_count(ctx):
+    assert "3" in dispatch("/history", ctx).message
+
+
+def test_history_handles_empty_session():
+    assert "还没有历史" in dispatch("/history", CommandContext()).message
+
+
+def test_memory_reports_count_and_path():
+    ctx = CommandContext(memory_count=12, memory_path="/home/u/.envy/memory.db")
+    message = dispatch("/memory", ctx).message
+    assert "12" in message and "memory.db" in message
+
+
+def test_memory_says_so_when_disabled():
+    """没启用时说清楚是"没启用"，而不是显示 0 条让人以为库是空的。"""
+    message = dispatch("/memory", CommandContext()).message
+    assert "没有启用" in message
+
+
+def test_command_set_is_a_real_system(ctx):
+    """面试官问"你设计了哪些命令"——五六个才撑得起"体系"这个说法。"""
+    functional = {name for name in COMMANDS if name not in {"quit"}}   # quit 是别名
+    assert len(functional) >= 6
+
+
 # ---------------------------------------------------------------- 渲染
 
 

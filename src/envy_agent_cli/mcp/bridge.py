@@ -58,7 +58,8 @@ def translate_error(exc: McpError) -> NoReturn:
     """
     if exc.code is McpErrorCode.TIMEOUT:
         raise TimeoutError(exc.message) from exc
-    if exc.code in (McpErrorCode.CONNECT_FAILED, McpErrorCode.TRANSPORT_CLOSED):
+    if exc.code in (McpErrorCode.CONNECT_FAILED, McpErrorCode.TRANSPORT_CLOSED,
+                    McpErrorCode.SESSION_EXPIRED):
         raise ConnectionError(exc.message) from exc
     raise RuntimeError(exc.message) from exc
 

@@ -401,6 +401,53 @@ def test_call_tool_maps_invalid_params_to_tool_not_found():
     assert exc.value.code is McpErrorCode.TOOL_NOT_FOUND
 
 
+def test_session_expiry_triggers_one_reconnect():
+    """会话失效 → 重连后重试一次，而不是把失败直接抛给调用方。"""
+    transport = FakeTransport({
+        "initialize": [{}, {}],                    # 初次握手 + 重连各一次
+        "tools/call": [
+            McpError(McpErrorCode.SESSION_EXPIRED, "会话没了"),
+            {"content": [{"type": "text", "text": "好了"}]},
+        ],
+    })
+    client = McpClient(fake_spec(), transport=transport)
+    client.connect()
+
+    assert client.call_tool("echo", {}).text == "好了"
+    assert transport.methods().count("initialize") == 2      # 确实重新握了手
+
+
+def test_reconnect_gives_up_after_one_retry():
+    """只试一次：重连后还失败说明问题不在会话，继续重试只是把一次失败拖成多次。"""
+    transport = FakeTransport({
+        "initialize": [{}, {}],
+        "tools/call": [
+            McpError(McpErrorCode.SESSION_EXPIRED, "没了"),
+            McpError(McpErrorCode.SESSION_EXPIRED, "还是没了"),
+        ],
+    })
+    client = McpClient(fake_spec(), transport=transport)
+    client.connect()
+
+    with pytest.raises(McpError) as exc:
+        client.call_tool("echo", {})
+    assert exc.value.code is McpErrorCode.SESSION_EXPIRED
+
+
+def test_non_session_errors_are_not_retried():
+    """其它错误**不该**触发重连——那会把确定性的失败变成一次多余的握手。"""
+    transport = FakeTransport({
+        "initialize": [{}],
+        "tools/call": [McpError(McpErrorCode.CALL_FAILED, "远端炸了")],
+    })
+    client = McpClient(fake_spec(), transport=transport)
+    client.connect()
+
+    with pytest.raises(McpError):
+        client.call_tool("echo", {})
+    assert transport.methods().count("initialize") == 1
+
+
 @pytest.mark.parametrize("blocks, expected", [
     ([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}], "a\nb"),
     ([{"type": "image"}], "[image 类型内容未展开]"),
@@ -461,6 +508,7 @@ def test_projection_tolerates_missing_or_malformed_required():
     (McpErrorCode.TIMEOUT, TimeoutError),
     (McpErrorCode.CONNECT_FAILED, ConnectionError),
     (McpErrorCode.TRANSPORT_CLOSED, ConnectionError),
+    (McpErrorCode.SESSION_EXPIRED, ConnectionError),
     (McpErrorCode.PROTOCOL_ERROR, RuntimeError),
     (McpErrorCode.TOOL_NOT_FOUND, RuntimeError),
 ])

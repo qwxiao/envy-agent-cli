@@ -111,8 +111,11 @@ def register_memory_tools(
             required_keys=("query",),
         ),
         handler=search_memory,
-        read_only=True,
-        concurrency_safe=True,
+        # ⚠️ **它不是只读**：召回时会更新 `access_count`（淘汰排序要用它）。
+        # 标成只读会让"标记"与"行为"对不上——被问"只读工具真的只读吗"就答不上来。
+        # 代价是检索也串行执行；但模型很少并发调它，用这点代价换标记的诚实很划算。
+        read_only=False,
+        concurrency_safe=False,
     ))
 
     return store

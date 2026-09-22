@@ -130,6 +130,33 @@ class McpClient:
     def close(self) -> None:
         self._transport.close()
 
+    def reconnect(self) -> None:
+        """重开通道并**重新握手**。
+
+        会话失效不是普通错误，而是"服务端把我们忘了"——必须重走一遍
+        `initialize` + `notifications/initialized`。光把请求重发一遍没用：
+        服务端那边还是一片空白，它照样不认识我们。
+        """
+        self.close()
+        self.connect()
+
+    def _with_reconnect(self, action):
+        """执行一次动作；若因会话失效而失败，重连后**再试一次**。
+
+        只试一次是刻意的：会话失效属于"环境事实"（服务端重启或超时），
+        重连后仍然失败就说明问题不在会话，继续重试只是把一次失败拖成多次。
+
+        重试安全的前提：`SESSION_EXPIRED` 意味着请求**根本没被处理**
+        （服务端不认识这个会话），所以不会重复副作用。
+        """
+        try:
+            return action()
+        except McpError as exc:
+            if exc.code is not McpErrorCode.SESSION_EXPIRED:
+                raise
+            self.reconnect()
+            return action()
+
     @property
     def closed(self) -> bool:
         return self._transport.closed
@@ -182,6 +209,9 @@ class McpClient:
                 工具**执行失败不算异常**——走返回值的 `is_error`，
                 与内置工具的失败路径保持一致。
         """
+        return self._with_reconnect(lambda: self._call_tool_once(name, arguments))
+
+    def _call_tool_once(self, name: str, arguments: dict | None) -> McpToolResult:
         try:
             result = self._transport.request("tools/call", {
                 "name": name,

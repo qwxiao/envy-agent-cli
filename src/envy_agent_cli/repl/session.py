@@ -31,6 +31,7 @@ from envy_agent_cli.context import ContextPolicy
 from envy_agent_cli.llm import ChatParams, ChatModel
 from envy_agent_cli.llm.adapter import ChatMessage
 from envy_agent_cli.loop import AgentResult, run
+from envy_agent_cli.memory import MemoryStore
 from envy_agent_cli.repl.commands import (
     COMPLETION_WORDS,
     CommandContext,
@@ -92,6 +93,7 @@ def run_repl(
     audit: AuditLogger | None = None,
     context_policy: ContextPolicy | None = None,
     show_reasoning: bool = False,
+    memory_store: MemoryStore | None = None,
     console: Console | None = None,
     session: PromptSession | None = None,
 ) -> int:
@@ -121,7 +123,7 @@ def run_repl(
             continue
 
         if line.startswith("/"):
-            outcome = dispatch(line, _context(adapter, workspace, messages))
+            outcome = dispatch(line, _context(adapter, workspace, messages, memory_store))
             if outcome.message:
                 renderer.print_plain(outcome.message)
             if outcome.should_clear:
@@ -156,13 +158,23 @@ def run_repl(
     return 0
 
 
-def _context(adapter: ChatModel, workspace: Path, messages: list[ChatMessage]) -> CommandContext:
+def _context(adapter: ChatModel, workspace: Path, messages: list[ChatMessage],
+             memory_store: MemoryStore | None = None) -> CommandContext:
+    # 记忆条数是这里唯一要查库的字段。**失败不抛**——一条诊断命令不该把会话弄崩；
+    # 读不到就给 0 并照常显示路径，用户能分辨"读不到"与"本来就没有"。
+    try:
+        memory_count = memory_store.count() if memory_store is not None else 0
+    except Exception:                       # noqa: BLE001 - 诊断路径，故意兜底
+        memory_count = 0
+
     return CommandContext(
         provider=adapter.name,
         model=getattr(adapter, "model", "") or "",
         workspace=str(workspace),
         tool_names=all_names(),
         message_count=len(messages),
+        memory_count=memory_count,
+        memory_path=str(memory_store.path) if memory_store is not None else "",
     )
 
 

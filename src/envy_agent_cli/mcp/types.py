@@ -44,6 +44,7 @@ class McpErrorCode(str, Enum):
     TOOL_NOT_FOUND = "TOOL_NOT_FOUND"        # 远端没有这个工具
     CALL_FAILED = "CALL_FAILED"              # 工具执行失败（远端报错）
     TRANSPORT_CLOSED = "TRANSPORT_CLOSED"    # 通道已关闭还发请求
+    SESSION_EXPIRED = "SESSION_EXPIRED"      # HTTP 会话失效（服务端重启或超时）
 
 
 class McpError(Exception):

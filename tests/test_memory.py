@@ -236,8 +236,10 @@ def test_register_memory_tools(clean_registry, tmp_path):
     assert saved.read_only is False and saved.concurrency_safe is False
     assert saved.spec.required_keys == ("content",)
 
+    # 召回时会更新 access_count（淘汰排序要用），所以它**不是纯只读**。
+    # 标成只读会让标记与行为对不上——被问"只读工具真的只读吗"就答不上来。
     searched = registry.get("search_memory")
-    assert searched.read_only is True and searched.concurrency_safe is True
+    assert searched.read_only is False and searched.concurrency_safe is False
 
     saved.handler(content="项目用 hatchling 构建", kind="fact")
     assert "hatchling" in searched.handler(query="构建工具")

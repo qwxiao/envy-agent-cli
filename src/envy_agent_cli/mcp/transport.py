@@ -169,6 +169,10 @@ class StdioTransport:
                 server=self.server,
             ) from exc
 
+        # ⚠️ 重置队列：`start()` 必须可重入（重连时会再调一次）。
+        # 上一次退出时推进去的 `_CLOSED` 哨兵若留着，新的等待方会立刻
+        # 以为"通道又关了"——一个只在重连路径上出现的诡异失败。
+        self._queue = queue.Queue()
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
         self._closed = False
@@ -394,6 +398,17 @@ class StreamableHttpTransport:
                 session_id = response.headers.get("mcp-session-id")
                 if session_id:
                     self._session_id = session_id
+
+                if response.status_code == 404 and self._session_id:
+                    # 服务端不认这个会话了（多半是它重启过）。清掉标识——
+                    # 下一次请求会以新会话的身份发出去；要不要重新握手由客户端层决定，
+                    # 传输层只管报告"这个会话没了"这个事实。
+                    self._session_id = None
+                    raise McpError(
+                        McpErrorCode.SESSION_EXPIRED,
+                        "服务端不认识当前会话（通常是它重启过）",
+                        server=self.server,
+                    )
 
                 if response.status_code >= 400:
                     detail = response.read().decode(errors="replace")[:300]
