@@ -130,8 +130,11 @@ def test_memory_says_so_when_disabled():
     assert "没有启用" in message
 
 
-def test_command_set_is_a_real_system(ctx):
-    """面试官问"你设计了哪些命令"——五六个才撑得起"体系"这个说法。"""
+def test_command_set_covers_the_basics(ctx):
+    """命令集至少要覆盖：帮助、退出、清历史、看工具、看模型、看会话。
+
+    少于这个数，命令表就只是个装饰——用户该有的动作得靠猜。
+    """
     functional = {name for name in COMMANDS if name not in {"quit"}}   # quit 是别名
     assert len(functional) >= 6
 
