@@ -26,9 +26,28 @@ from envy_agent_cli.llm import ChatParams, available, build
 from envy_agent_cli.llm.adapter import PROVIDER_DEFAULTS
 from envy_agent_cli.llm.events import LLMErrorCode
 from envy_agent_cli.loop import ConsoleRenderer, run
+from envy_agent_cli.memory import register_memory_tools
+from envy_agent_cli.mcp import (
+    McpError,
+    McpSession,
+    connect_mcp_servers,
+    describe_mcp_config,
+    load_mcp_server_specs,
+)
 from envy_agent_cli.tools.builtin import register_builtin_tools
 from envy_agent_cli.tools.registry import to_model_schemas
+from envy_agent_cli.tools.workspace import register_workspace_tools
 from envy_agent_cli.tools.runtime import UNTRUSTED_DATA_NOTICE, ToolRuntime
+
+# 交互层是**可选依赖**（`pip install envy-agent-cli[repl]`）。
+# 没装就退化成单次执行模式，而不是抛 ImportError 把人挡在门外——
+# 核心引擎只有 httpx，不该被一个终端 UI 的缺席拖住。
+try:
+    from envy_agent_cli.repl import repl_confirm, run_repl
+
+    REPL_AVAILABLE = True
+except ImportError:                       # pragma: no cover - 取决于安装方式
+    REPL_AVAILABLE = False
 
 USAGE = """用法：
   envy <问题>                        跑一次任务（模型自己决定调什么工具）
@@ -39,10 +58,18 @@ USAGE = """用法：
   envy --context-window 128000 <问题> 模型窗口（用于上下文压缩的预算线）
   envy --no-compact <问题>           关掉上下文压缩（历史原样累积，长任务会撑爆窗口）
   envy --yes                         本次全自动（等价于 --hitl never）
+  envy --no-mcp <问题>               本次不加载 MCP 工具
+  envy --no-memory <问题>            本次不注册长期记忆工具
   envy --list-providers              列出已注册厂商与默认入口
+  envy --list-mcp                    列出配置里的 MCP server
 
 凭证来自环境变量或 .env：<厂商名>_API_KEY（如 DEEPSEEK_API_KEY / GLM_API_KEY）。
 审计轨迹写在 audit/cli.jsonl，可用 trace_id 串起一次任务。
+
+MCP 工具来自 `.envy/mcp.json`（项目级）与 `~/.envy/mcp.json`（用户级），
+配置格式与 Claude Desktop / Cursor 一致（顶层 `mcpServers`）。
+远端工具注册成 `mcp__<server>__<tool>`，走**同一个 ToolRuntime**——
+鉴权、审批、超时熔断、审计对内外部工具一视同仁。
 
 上下文压缩默认开：每轮发请求前检查历史是否超预算，超了就把旧轮次摘要掉。
 压缩事件落在审计里（kind=compact），与结果里的 context_events 同源。"""
@@ -60,7 +87,7 @@ def _parse_args(argv: list[str]) -> tuple[dict[str, str], list[str]]:
     """极简参数解析：`--key value` 形式的选项 + 其余位置参数。"""
     options: dict[str, str] = {}
     rest: list[str] = []
-    flags = {"list-providers", "yes"}
+    flags = {"list-providers", "list-mcp", "yes", "no-mcp", "no-memory"}
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -79,20 +106,74 @@ def _parse_args(argv: list[str]) -> tuple[dict[str, str], list[str]]:
     return options, rest
 
 
+def _print_help() -> None:
+    print(USAGE)
+    info = describe_config()
+    print(f"\n.env 中的键：{info['from_file'] or '（未找到 .env）'}")
+    print(f"已配置凭证的厂商：{info['providers_with_key'] or '（无）'}")
+    mcp = describe_mcp_config()
+    if "error" not in mcp and (mcp["stdio"] or mcp["http"]):
+        print(f"MCP server：stdio={mcp['stdio'] or '无'}  http={mcp['http'] or '无'}")
+
+
+def _connect_mcp(options: dict[str, str]) -> McpSession | None:
+    """按配置连接 MCP server。
+
+    **失败不阻断启动**：配置读不出来、某个 server 连不上，都只打一行提示就继续——
+    内置工具照常可用。这比"少一个 server 整个 CLI 起不来"合理得多。
+
+    返回 `None` 表示"没有要接的"（没配置，或显式 `--no-mcp`）。
+    """
+    if "no-mcp" in options:
+        return None
+    try:
+        specs = load_mcp_server_specs(Path.cwd())
+    except McpError as exc:
+        print(f"[MCP] 配置读取失败：{exc}", file=sys.stderr)
+        return None
+    if not specs:
+        return None
+
+    session = connect_mcp_servers(specs)
+    for error in session.errors:
+        print(f"[MCP] 跳过 {error}", file=sys.stderr)
+    if session.tool_count:
+        print(f"[MCP] 接入 {session.tool_count} 个工具：{', '.join(session.tools)}", file=sys.stderr)
+    return session
+
+
 def main(argv: list[str] | None = None) -> int:
     options, rest = _parse_args(list(sys.argv[1:] if argv is None else argv))
 
-    if "help" in options or "h" in options or (not rest and not options):
-        print(USAGE)
-        info = describe_config()
-        print(f"\n.env 中的键：{info['from_file'] or '（未找到 .env）'}")
-        print(f"已配置凭证的厂商：{info['providers_with_key'] or '（无）'}")
+    if "help" in options or "h" in options:
+        _print_help()
+        return 0
+
+    # 不带参数 = 想进交互模式。但管道里跑（stdin 不是终端）时不能进——
+    # 那会让进程静默挂在那里等永远不会来的输入。没装交互依赖时同理。
+    interactive = not rest and not options
+    if interactive and (not sys.stdin.isatty() or not REPL_AVAILABLE):
+        _print_help()
         return 0
 
     if "list-providers" in options:
         print(f"已注册厂商：{', '.join(available())}（默认 {DEFAULT_PROVIDER}）")
         for name, defaults in sorted(PROVIDER_DEFAULTS.items()):
             print(f"  {name:10s} {defaults['base_url']}  模型 {defaults['model']}")
+        return 0
+
+    if "list-mcp" in options:
+        info = describe_mcp_config()
+        if "error" in info:
+            print(f"配置读取失败：{info['error'][0]}", file=sys.stderr)
+            return 2
+        if not info["stdio"] and not info["http"]:
+            print("没有配置任何 MCP server。")
+            print(f"项目级：{Path.cwd() / '.envy' / 'mcp.json'}")
+            print(f"用户级：{Path.home() / '.envy' / 'mcp.json'}")
+            return 0
+        print(f"stdio：{', '.join(info['stdio']) or '（无）'}")
+        print(f"http ：{', '.join(info['http']) or '（无）'}")
         return 0
 
     try:
@@ -107,9 +188,14 @@ def main(argv: list[str] | None = None) -> int:
 
     workspace = Path.cwd()
     register_builtin_tools(workspace)
+    register_workspace_tools(workspace)
+    if "no-memory" not in options:
+        register_memory_tools(workspace)
     hitl_mode = "never" if "yes" in options else options.get("hitl", "auto")
     audit = None if "no-audit" in options else AuditLogger(Path("audit") / "cli.jsonl")
-    runtime = ToolRuntime(workspace=workspace, hitl_mode=hitl_mode, audit=audit)
+    # 交互模式下用 REPL 版的审批提示（Rich 样式、默认拒绝），单次执行模式用默认的
+    runtime = ToolRuntime(workspace=workspace, hitl_mode=hitl_mode, audit=audit,
+                          confirm=repl_confirm if interactive else None)
 
     params = ChatParams(max_tokens=2048)
     if "no-compact" in options:
@@ -125,18 +211,36 @@ def main(argv: list[str] | None = None) -> int:
             summary_engine=RuleSummaryEngine(),
         )
 
-    print(f"[{adapter.name} · {adapter.model}] 工作区 {workspace}  HITL={hitl_mode}  "
-          f"压缩={'关' if 'no-compact' in options else '开'}", file=sys.stderr)
+    if not interactive:
+        print(f"[{adapter.name} · {adapter.model}] 工作区 {workspace}  HITL={hitl_mode}  "
+              f"压缩={'关' if 'no-compact' in options else '开'}", file=sys.stderr)
 
-    result = run(" ".join(rest),
-                 adapter=adapter,
-                 runtime=runtime,
-                 tool_schemas=to_model_schemas(),
-                 render=ConsoleRenderer(),
-                 params=params,
-                 system_prompt=SYSTEM_PROMPT,
-                 audit=audit,
-                 context_policy=policy)
+    # ⚠️ 必须在 to_model_schemas() 之前接上——那张表是快照，之后再注册就投影不进去了
+    mcp_session = _connect_mcp(options)
+    try:
+        if interactive:
+            return run_repl(
+                adapter=adapter,
+                runtime=runtime,
+                tool_schemas=to_model_schemas(),
+                system_prompt=SYSTEM_PROMPT,
+                params=params,
+                workspace=workspace,
+                audit=audit,
+                context_policy=policy,
+            )
+        result = run(" ".join(rest),
+                     adapter=adapter,
+                     runtime=runtime,
+                     tool_schemas=to_model_schemas(),
+                     render=ConsoleRenderer(),
+                     params=params,
+                     system_prompt=SYSTEM_PROMPT,
+                     audit=audit,
+                     context_policy=policy)
+    finally:
+        if mcp_session is not None:
+            mcp_session.close()
 
     print()
     summary = (f"[{result.stop_reason}] 轮数={result.iterations} "

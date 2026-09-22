@@ -129,6 +129,7 @@ def run(
     audit: AuditLogger | None = None,
     audit_reasoning: bool = True,
     context_policy: ContextPolicy | None = None,
+    history: list[ChatMessage] | None = None,
 ) -> AgentResult:
     """跑完一次完整的用户任务。
 
@@ -149,8 +150,13 @@ def run(
     policy = context_policy or NoopContextPolicy()
 
     trace = new_trace()
-    messages: list[ChatMessage] = []
-    if system_prompt:
+    # `history` 是给交互式会话（REPL）用的：把上一轮结束时 `AgentResult.messages`
+    # 原样传回来，这一轮就接着那段历史继续。默认 None = 单次任务，行为与从前完全一致。
+    #
+    # ⚠️ 这里只接**数据**，不接行为——斜杠命令、渲染方式、退出逻辑，
+    # 一个字都不许渗进 Loop。那才是"REPL 不许改 Loop"这条底线的真实含义。
+    messages: list[ChatMessage] = list(history) if history else []
+    if system_prompt and not any(m.get("role") == "system" for m in messages):
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": question})
     started = time.monotonic()

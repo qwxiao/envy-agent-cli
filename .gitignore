@@ -26,3 +26,6 @@ htmlcov/
 *.log
 audit/*.jsonl
 .cache/
+
+# 本地配置：MCP server 声明可能带凭证（推荐用 ${VAR} 占位），一律不入库
+.envy/
